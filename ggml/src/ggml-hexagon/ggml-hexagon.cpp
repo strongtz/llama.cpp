@@ -2090,7 +2090,14 @@ void ggml_hexagon_session::mmap_buffers_budgeted() {
         while (!sbuf->try_mmap(true)) {
             // IOVA fragmentation: free more space and retry
             if (!evict_one()) {
-                if (!sbuf->try_mmap(false)) {
+                // nothing left to evict: the IOVA space may still be held by a process that just
+                // exited (released asynchronously by the kernel), retry for a while before failing
+                bool ok = false;
+                for (int retry = 0; retry < 20 && !ok; ++retry) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                    ok = sbuf->try_mmap(retry < 19);
+                }
+                if (!ok) {
                     throw std::runtime_error("ggml-hex: fastrpc_mmap failed (see log for details)");
                 }
                 break;

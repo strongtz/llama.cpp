@@ -71,7 +71,8 @@ static inline void htp_gdn_vtcm_layout_build(
 ) {
     size_t state_bytes = (size_t) S_v * S_v * sizeof(float);
     L->state_aligned = hex_round_up(state_bytes, 128);
-    L->bytes_per_hvx = 2 * L->state_aligned;
+    // 2 DMA buffers + transposed working state + scratch for the KDA fast path
+    L->bytes_per_hvx = 3 * L->state_aligned + 2048;
     size_t off = 0;
     VTCM_LAYOUT_ALLOC(off, off_state, L->bytes_per_hvx * n_hvx);
     L->total_bytes = off;

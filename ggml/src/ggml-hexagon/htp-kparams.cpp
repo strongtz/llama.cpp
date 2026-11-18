@@ -643,7 +643,11 @@ static bool htp_matmul_is_hmx_eligible(
         return false;
     }
     if (!is_matmul_id && is_batched && is_tiled) {
-        return false;
+        // handled by looping the 2D kernel over dim 2 on the DSP
+        if (src0->ne[3] != 1 || src1->ne[3] != 1 || src0->ne[2] == 0 || src1->ne[2] % src0->ne[2] != 0 ||
+            src1->nb[0] != ggml_type_size(src1->type)) {
+            return false;
+        }
     }
 
     if (src0->nb[0] > src0->nb[1] || src1->nb[0] > src1->nb[1]) {
@@ -741,7 +745,7 @@ static bool htp_kparams_solve_hmx_mm(
     kparams->div_n_act_hvx      = init_fastdiv_values(act_hvx_selected);
     kparams->div_ne00_padded    = init_fastdiv_values(ne00_padded);
     kparams->vtcm_bias_size     = (int32_t) src2_size;
-    kparams->kernel_type        = (is_batched && !is_matmul_id) ? HTP_MM_KERNEL_HMX_BATCHED : HTP_MM_KERNEL_HMX_2D;
+    kparams->kernel_type        = (is_batched && !is_matmul_id && !is_tiled) ? HTP_MM_KERNEL_HMX_BATCHED : HTP_MM_KERNEL_HMX_2D;
     return true;
 }
 

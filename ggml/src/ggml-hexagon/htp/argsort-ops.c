@@ -840,6 +840,51 @@ static void htp_sort_multi_row_job(const htp_thread_t * th, unsigned int n, unsi
     }
 }
 
+// short rows (<= 32 elements): sort straight from cached memory, per-row DMA would dominate
+struct htp_sort_small_ctx {
+    const struct htp_tensor * src0;
+    const struct htp_tensor * dst;
+    uint32_t row_start;
+    uint32_t row_end;
+    uint32_t nrows_per_hvx;
+    bool     asc;
+};
+
+static void htp_sort_small_rows_job(const htp_thread_t * th, unsigned int n, unsigned int ith, void * data) {
+    (void) th; (void) n;
+    const struct htp_sort_small_ctx * c = (const struct htp_sort_small_ctx *) data;
+    const struct htp_tensor * src0 = c->src0;
+    const struct htp_tensor * dst  = c->dst;
+    const uint32_t ne00 = src0->ne[0];
+    const uint32_t ne01 = src0->ne[1];
+    const uint32_t ne02 = src0->ne[2];
+    const uint32_t r0 = c->row_start + ith * c->nrows_per_hvx;
+    const uint32_t r1 = MIN(r0 + c->nrows_per_hvx, c->row_end);
+    float   v[32];
+    int32_t idx[32];
+    for (uint32_t r = r0; r < r1; ++r) {
+        const uint32_t i01 = r % ne01;
+        const uint32_t i02 = (r / ne01) % ne02;
+        const uint32_t i03 = r / (ne01 * ne02);
+        const float * src = (const float *) ((const uint8_t *) (uintptr_t) src0->data + i01 * src0->nb[1] + i02 * src0->nb[2] + i03 * src0->nb[3]);
+        int32_t * out = (int32_t *) ((uint8_t *) (uintptr_t) dst->data + i01 * dst->nb[1] + i02 * dst->nb[2] + i03 * dst->nb[3]);
+        for (uint32_t i = 0; i < ne00; ++i) {
+            const float x = src[i];
+            int32_t j = (int32_t) i - 1;
+            if (c->asc) {
+                while (j >= 0 && v[j] > x) { v[j + 1] = v[j]; idx[j + 1] = idx[j]; --j; }
+            } else {
+                while (j >= 0 && v[j] < x) { v[j + 1] = v[j]; idx[j + 1] = idx[j]; --j; }
+            }
+            v[j + 1] = x;
+            idx[j + 1] = (int32_t) i;
+        }
+        for (uint32_t i = 0; i < ne00; ++i) {
+            out[i] = idx[i];
+        }
+    }
+}
+
 static int op_sort_common(struct htp_ops_context * octx, bool is_top_k) {
     if (octx->src[0]->type != HTP_TYPE_F32) {
         return HTP_STATUS_NO_SUPPORT;
@@ -878,6 +923,18 @@ static int op_sort_common(struct htp_ops_context * octx, bool is_top_k) {
 
     if (!htp_ops_context_set_n_hvx(octx, kparams->n_hvx)) {
         return HTP_STATUS_INVAL_PARAMS;
+    }
+
+    if (!is_top_k && ne00 <= 32 && src0->nb[0] == sizeof(float) && dst->nb[0] == sizeof(int32_t)) {
+        struct htp_sort_small_ctx sctx;
+        sctx.src0 = src0;
+        sctx.dst  = dst;
+        sctx.row_start = row_start;
+        sctx.row_end   = row_end;
+        sctx.nrows_per_hvx = (nrows + octx->n_hvx - 1) / octx->n_hvx;
+        sctx.asc = ((enum ggml_sort_order) kparams->order) == GGML_SORT_ORDER_ASC;
+        work_queue_run(octx->ctx->hvx_queue, htp_sort_small_rows_job, &sctx, octx->n_hvx);
+        return HTP_STATUS_OK;
     }
 
     struct htp_sort_vtcm_layout layout;

@@ -1614,6 +1614,10 @@ static void transfer_activation_row_pair_fp32_to_fp16_col_chunk(
     }
 }
 
+#ifndef HTP_MM_ACT_PREFETCH_ROWS
+#define HTP_MM_ACT_PREFETCH_ROWS 2
+#endif
+
 static void transfer_activation_chunk_fp32_to_fp16_gathered(
             __fp16 *restrict vtcm_dst,
             const float *restrict src,
@@ -1651,6 +1655,15 @@ static void transfer_activation_chunk_fp32_to_fp16_gathered(
 
         const float *row0_ptr = (const float *) ((const uint8_t *) src + i11_0 * nb11 + mapping0.i2 * nb12);
         const float *row1_ptr = (const float *) ((const uint8_t *) src + i11_1 * nb11 + mapping1.i2 * nb12);
+
+        // prefetch the rows used a few iterations ahead (rows are scattered, no HW prefetch)
+        if (r + 2 * HTP_MM_ACT_PREFETCH_ROWS + 1 < n_rows_tiled) {
+            for (uint32_t pr = 0; pr < 2; ++pr) {
+                struct mmid_row_mapping mp = matrix_rows[cur_a * mapping_stride + r_idx0 + 2 * HTP_MM_ACT_PREFETCH_ROWS + pr];
+                uint32_t i11_p = fastmodulo(mp.i1, ne11, ne11_div);
+                hex_l2fetch((const uint8_t *) src + i11_p * nb11 + mp.i2 * nb12, k_valid * sizeof(float), k_valid * sizeof(float), 1);
+            }
+        }
 
         uint32_t c = 0;
         for (; c + 32 <= k_valid; c += 32) {

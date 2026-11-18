@@ -3769,17 +3769,29 @@ static int hmx_mm_op_matmul(struct htp_ops_context * octx, const struct htp_mm_k
                              &kparams->div_ne00_padded,
                              kparams->vtcm_size);
     } else {
-        ret = hmx_mm_2d_f32(
-            octx->ctx, octx->ctx->dma[0], dst_ptr, src2_addr, src2_bytes,
-            act_addr, src0->data,
-            m_rows, k, n, act_stride, act_elem_size, (int) src0->nb[1], (int) src0->type, (int) act->ne[0],
-            dst_stride, src2_stride, (int)dst->ne[0],
-            kparams->m_chunk, kparams->n_chunk, kparams->pipeline, n_hvx,
-            kparams->n_act_hvx,
-            &kparams->div_n_act_hvx,
-            &kparams->div_ne00_padded,
-            kparams->tile_size, kparams->aligned_tile_size, kparams->vtcm_size
-        );
+        // batched weights (e.g. per-head MLA projections) with the 2D kernel: one call per batch
+        const uint32_t nb_act = (uint32_t) (ne12 > 0 ? ne12 : 1);
+        const uint32_t r2     = (ne02 > 0) ? (uint32_t) (ne12 / ne02) : 1;
+        for (uint32_t i12 = 0; i12 < nb_act; ++i12) {
+            const uint32_t i02 = i12 / r2;
+            ret = hmx_mm_2d_f32(
+                octx->ctx, octx->ctx->dma[0],
+                (float *) ((uint8_t *) dst_ptr + (size_t) i12 * dst->nb[2]),
+                src2_addr, src2_bytes,
+                act_addr + (size_t) i12 * act->nb[2],
+                src0->data + (size_t) i02 * src0->nb[2],
+                m_rows, k, n, act_stride, act_elem_size, (int) src0->nb[1], (int) src0->type, (int) act->ne[0],
+                dst_stride, src2_stride, (int)dst->ne[0],
+                kparams->m_chunk, kparams->n_chunk, kparams->pipeline, n_hvx,
+                kparams->n_act_hvx,
+                &kparams->div_n_act_hvx,
+                &kparams->div_ne00_padded,
+                kparams->tile_size, kparams->aligned_tile_size, kparams->vtcm_size
+            );
+            if (ret != 0) {
+                break;
+            }
+        }
     }
 
     if (ret != 0) {

@@ -748,6 +748,116 @@ static inline void gdn_step_scalar_f32(
     }
 }
 
+// KDA step on a transposed state T[i][j] = S[j][i] (S_v == 128): all reductions over the
+// key dimension i become vector multiply-adds with a broadcast scalar, no horizontal sums.
+//   T[i][:] *= g_i ; s[:] = sum_i T[i][:] k_i ; delta = beta (v - s)
+//   T[i][:] += k_i delta ; o[:] = sum_i T[i][:] q_i
+static inline void gdn_step_kda_t128_f32(
+    float * restrict t_work,
+    float * restrict attn_out,
+    const float * restrict q_t,
+    const float * restrict k_t,
+    const float * restrict v_t,
+    const float * restrict g_t,
+    float beta_val,
+    float scale,
+    float * restrict scratch_unused
+) {
+    // scalar reads from VTCM are slow, keep the per-row coefficients in cached memory
+    float scratch[512] __attribute__((aligned(128)));
+    (void) scratch_unused;
+    float * gs  = scratch;
+    float * ks  = scratch + 128;
+    float * qs  = scratch + 256;
+    float * gks = scratch + 384;
+    for (int i = 0; i < 4; ++i) {
+        const HVX_Vector vg = hvx_vec_exp_f32(hvx_vmemu(g_t + i * 32));
+        const HVX_Vector vk = hvx_vmemu(k_t + i * 32);
+        ((HVX_Vector *) gs)[i]  = vg;
+        ((HVX_Vector *) ks)[i]  = vk;
+        ((HVX_Vector *) qs)[i]  = hvx_vmemu(q_t + i * 32);
+        ((HVX_Vector *) gks)[i] = hvx_vec_mul_f32_f32(vg, vk);
+    }
+
+    HVX_Vector * T = (HVX_Vector *) t_work;
+
+#if __HVX_ARCH__ < 79
+#define QMPY(a, b)  Q6_Vqf32_vmpy_VsfVsf(a, b)
+#define QADD(a, b)  Q6_Vqf32_vadd_Vqf32Vqf32(a, b)
+#define QTOF(a)     Q6_Vsf_equals_Vqf32(a)
+#define QZERO       Q6_V_vzero()
+#else
+#define QMPY(a, b)  Q6_Vsf_vmpy_VsfVsf(a, b)
+#define QADD(a, b)  Q6_Vsf_vadd_VsfVsf(a, b)
+#define QTOF(a)     (a)
+#define QZERO       Q6_V_vzero()
+#endif
+
+    // s = sum_i (T[i] * g_i) * k_i = sum_i T[i] * (g_i k_i)
+    HVX_Vector a0 = QZERO, a1 = QZERO, a2 = QZERO, a3 = QZERO;
+    #pragma unroll(4)
+    for (int i = 0; i < 128; ++i) {
+        const HVX_Vector vgk = hvx_vec_splat_f32(gks[i]);
+        const HVX_Vector * row = T + i * 4;
+        a0 = QADD(a0, QMPY(row[0], vgk));
+        a1 = QADD(a1, QMPY(row[1], vgk));
+        a2 = QADD(a2, QMPY(row[2], vgk));
+        a3 = QADD(a3, QMPY(row[3], vgk));
+    }
+
+    const HVX_Vector vbeta = hvx_vec_splat_f32(beta_val);
+    const HVX_Vector d0 = hvx_vec_mul_f32_f32(hvx_vec_sub_f32_f32(hvx_vmemu(v_t +  0), QTOF(a0)), vbeta);
+    const HVX_Vector d1 = hvx_vec_mul_f32_f32(hvx_vec_sub_f32_f32(hvx_vmemu(v_t + 32), QTOF(a1)), vbeta);
+    const HVX_Vector d2 = hvx_vec_mul_f32_f32(hvx_vec_sub_f32_f32(hvx_vmemu(v_t + 64), QTOF(a2)), vbeta);
+    const HVX_Vector d3 = hvx_vec_mul_f32_f32(hvx_vec_sub_f32_f32(hvx_vmemu(v_t + 96), QTOF(a3)), vbeta);
+
+    // T[i] = T[i] * g_i + k_i * delta ; o = sum_i T[i] * q_i
+    a0 = QZERO; a1 = QZERO; a2 = QZERO; a3 = QZERO;
+    #pragma unroll(2)
+    for (int i = 0; i < 128; ++i) {
+        const HVX_Vector vg = hvx_vec_splat_f32(gs[i]);
+        const HVX_Vector vk = hvx_vec_splat_f32(ks[i]);
+        const HVX_Vector vq = hvx_vec_splat_f32(qs[i]);
+        HVX_Vector * row = T + i * 4;
+        const HVX_Vector t0 = QTOF(QADD(QMPY(row[0], vg), QMPY(d0, vk)));
+        const HVX_Vector t1 = QTOF(QADD(QMPY(row[1], vg), QMPY(d1, vk)));
+        const HVX_Vector t2 = QTOF(QADD(QMPY(row[2], vg), QMPY(d2, vk)));
+        const HVX_Vector t3 = QTOF(QADD(QMPY(row[3], vg), QMPY(d3, vk)));
+        row[0] = t0; row[1] = t1; row[2] = t2; row[3] = t3;
+        a0 = QADD(a0, QMPY(t0, vq));
+        a1 = QADD(a1, QMPY(t1, vq));
+        a2 = QADD(a2, QMPY(t2, vq));
+        a3 = QADD(a3, QMPY(t3, vq));
+    }
+
+    const HVX_Vector vscale = hvx_vec_splat_f32(scale);
+    hvx_vmemu(attn_out +  0) = hvx_vec_mul_f32_f32(QTOF(a0), vscale);
+    hvx_vmemu(attn_out + 32) = hvx_vec_mul_f32_f32(QTOF(a1), vscale);
+    hvx_vmemu(attn_out + 64) = hvx_vec_mul_f32_f32(QTOF(a2), vscale);
+    hvx_vmemu(attn_out + 96) = hvx_vec_mul_f32_f32(QTOF(a3), vscale);
+#undef QMPY
+#undef QADD
+#undef QTOF
+#undef QZERO
+}
+
+#ifndef GDN_PREFETCH_DIST
+#define GDN_PREFETCH_DIST 4
+#endif
+
+static inline void gdn_transpose_128_f32(float * restrict dst, const float * restrict src) {
+    for (int b0 = 0; b0 < 128; b0 += 32) {
+        for (int b1 = 0; b1 < 128; b1 += 32) {
+            for (int r = b0; r < b0 + 32; ++r) {
+                const float * sr = src + r * 128 + b1;
+                for (int c = 0; c < 32; ++c) {
+                    dst[(b1 + c) * 128 + r] = sr[c];
+                }
+            }
+        }
+    }
+}
+
 static void gated_delta_net_f32_pp_thread(const htp_thread_t * th, unsigned int nth, unsigned int ith, void * data) {
     struct htp_gdn_context * gctx = (struct htp_gdn_context *) data;
     struct htp_ops_context * octx = gctx->octx;
@@ -782,6 +892,10 @@ static void gated_delta_net_f32_pp_thread(const htp_thread_t * th, unsigned int 
     float * s_work[2];
     s_work[0] = (float *) (gctx->vtcm_base + layout->bytes_per_hvx * ith);
     s_work[1] = s_work[0] + layout->state_aligned / sizeof(float);
+    // transposed state + scratch (only used by the KDA S_v == 128 fast path)
+    float * t_work  = s_work[1] + layout->state_aligned / sizeof(float);
+    float * scratch = t_work + layout->state_aligned / sizeof(float);
+    const bool use_t128 = kparams->kda && S_v == 128 && K == 1 && layout->bytes_per_hvx >= 3 * layout->state_aligned + 2048;
 
     const struct fastdiv_values * fd_H   = &kparams->div_H;
     const struct fastdiv_values * fd_q1  = &kparams->div_q1;
@@ -838,6 +952,31 @@ static void gated_delta_net_f32_pp_thread(const htp_thread_t * th, unsigned int 
         float * attn_data = dst_base + ((uint64_t) iv3 * n_tokens * H + iv1) * S_v;
 
         htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) ir);
+        if (use_t128) {
+            gdn_transpose_128_f32(t_work, s_work_curr);
+            for (uint32_t t = 0; t < n_tokens; ++t) {
+                const float * q_t = (const float *) ((const uint8_t *) (uintptr_t) q->data +
+                        (uint64_t) iq3 * q->nb[3] + (uint64_t) t * q->nb[2] + (uint64_t) iq1 * q->nb[1]);
+                const float * k_t = (const float *) ((const uint8_t *) (uintptr_t) k->data +
+                        (uint64_t) ik3 * k->nb[3] + (uint64_t) t * k->nb[2] + (uint64_t) ik1 * k->nb[1]);
+                const float * v_t = (const float *) ((const uint8_t *) (uintptr_t) v->data +
+                        (uint64_t) iv3 * v->nb[3] + (uint64_t) t * v->nb[2] + (uint64_t) iv1 * v->nb[1]);
+                const float * g_t = (const float *) ((const uint8_t *) (uintptr_t) g->data +
+                        (uint64_t) iv3 * g->nb[3] + (uint64_t) t * g->nb[2] + (uint64_t) iv1 * g->nb[1]);
+                const float beta_val = *(const float *) ((const uint8_t *) (uintptr_t) beta->data +
+                        (uint64_t) iv3 * beta->nb[3] + (uint64_t) t * beta->nb[2] + (uint64_t) iv1 * beta->nb[1]);
+                if (t + GDN_PREFETCH_DIST < n_tokens) {
+                    const uint64_t dt = (uint64_t) GDN_PREFETCH_DIST;
+                    hex_l2fetch((const uint8_t *) q_t + dt * q->nb[2], 512, 512, 1);
+                    hex_l2fetch((const uint8_t *) k_t + dt * k->nb[2], 512, 512, 1);
+                    hex_l2fetch((const uint8_t *) v_t + dt * v->nb[2], 512, 512, 1);
+                    hex_l2fetch((const uint8_t *) g_t + dt * g->nb[2], 512, 512, 1);
+                }
+                gdn_step_kda_t128_f32(t_work, attn_data, q_t, k_t, v_t, g_t, beta_val, scale, scratch);
+                attn_data += (uint64_t) S_v * H;
+            }
+            gdn_transpose_128_f32(s_work_curr, t_work);
+        } else
         for (uint32_t t = 0; t < n_tokens; ++t) {
             const float * q_t = (const float *) ((const uint8_t *) (uintptr_t) q->data +
                     (uint64_t) iq3 * q->nb[3] + (uint64_t) t * q->nb[2] + (uint64_t) iq1 * q->nb[1]);
