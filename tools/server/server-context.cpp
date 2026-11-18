@@ -1085,6 +1085,15 @@ private:
 
     server_batch batch;
 
+    // optional NPU prefill: a second copy of the target model on an accelerator device
+    // (e.g. HTP0) that processes large prompt segments, the sequence state is then
+    // transferred into ctx_tgt which keeps doing token generation
+    llama_model   * model_npu = nullptr;
+    llama_context * ctx_npu   = nullptr;
+    int32_t         npu_min_tokens = 64;
+    common_batch    npu_batch;
+    std::vector<uint8_t> npu_state_buf;
+
     llama_model   * model_dft = nullptr;
     llama_context * ctx_dft   = nullptr;
 
@@ -1141,6 +1150,15 @@ private:
 
         ctx_dft   = nullptr;
         model_dft = nullptr;
+
+        if (ctx_npu) {
+            llama_free(ctx_npu);
+            ctx_npu = nullptr;
+        }
+        if (model_npu) {
+            llama_model_free(model_npu);
+            model_npu = nullptr;
+        }
 
         llama_init.reset();
 
@@ -1203,6 +1221,153 @@ private:
 
     // load the model and initialize llama_context
     // this may also be called to resume from sleeping state
+    // env LLAMA_NPU_PREFILL=<device name>    enable NPU prefill on the given device (e.g. HTP0)
+    // env LLAMA_NPU_PREFILL_MIN=<n>          min. number of prompt tokens in a batch to use the NPU (default 64)
+    // env LLAMA_NPU_PREFILL_UBATCH=<n>       NPU micro batch size (default 1024)
+    // env LLAMA_NPU_PREFILL_MODEL=<path>     optional separate GGUF for the NPU copy (default: same as -m)
+    bool load_npu_prefill() {
+        const char * dev_name = getenv("LLAMA_NPU_PREFILL");
+        if (!dev_name || !dev_name[0]) {
+            return true;
+        }
+        ggml_backend_dev_t dev = ggml_backend_dev_by_name(dev_name);
+        if (!dev) {
+            SRV_ERR("NPU prefill: device %s not found\n", dev_name);
+            return false;
+        }
+        if (const char * v = getenv("LLAMA_NPU_PREFILL_MIN")) {
+            npu_min_tokens = std::max(1, atoi(v));
+        }
+        int32_t n_ubatch = 1024;
+        if (const char * v = getenv("LLAMA_NPU_PREFILL_UBATCH")) {
+            n_ubatch = std::max(32, atoi(v));
+        }
+        std::string path = params_base.model.path;
+        if (const char * v = getenv("LLAMA_NPU_PREFILL_MODEL")) {
+            path = v;
+        }
+
+        ggml_backend_dev_t devs[2] = { dev, nullptr };
+        llama_model_params mparams = common_model_params_to_llama(params_base);
+        mparams.devices      = devs;
+        mparams.n_gpu_layers = 999;
+        mparams.split_mode   = LLAMA_SPLIT_MODE_NONE;
+        mparams.main_gpu     = 0;
+        mparams.progress_callback = nullptr;
+        mparams.progress_callback_user_data = nullptr;
+
+        SRV_INF("NPU prefill: loading %s on %s\n", path.c_str(), dev_name);
+        model_npu = llama_model_load_from_file(path.c_str(), mparams);
+        if (!model_npu) {
+            SRV_ERR("NPU prefill: failed to load model %s\n", path.c_str());
+            return false;
+        }
+
+        llama_context_params cparams = common_context_params_to_llama(params_base);
+        cparams.n_ctx      = llama_n_ctx(ctx_tgt);
+        cparams.n_seq_max  = llama_n_seq_max(ctx_tgt);
+        cparams.n_batch    = n_ubatch;
+        cparams.n_ubatch   = n_ubatch;
+        cparams.embeddings = false;
+        cparams.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+        ctx_npu = llama_init_from_model(model_npu, cparams);
+        if (!ctx_npu) {
+            SRV_ERR("%s", "NPU prefill: failed to create context\n");
+            return false;
+        }
+        npu_batch = common_batch(ctx_npu);
+        SRV_INF("NPU prefill: enabled on %s (n_ubatch = %d, min tokens = %d)\n", dev_name, n_ubatch, npu_min_tokens);
+        return true;
+    }
+
+    void copy_seq_state(llama_context * src, llama_context * dst, llama_seq_id seq) {
+        llama_synchronize(src);
+        const size_t sz = llama_state_seq_get_size(src, seq);
+        npu_state_buf.resize(sz);
+        const size_t n_get = llama_state_seq_get_data(src, npu_state_buf.data(), sz, seq);
+        llama_synchronize(dst);
+        llama_memory_seq_rm(llama_get_memory(dst), seq, -1, -1);
+        if (n_get > 0) {
+            const size_t n_set = llama_state_seq_set_data(dst, npu_state_buf.data(), n_get, seq);
+            if (n_set == 0) {
+                throw std::runtime_error("NPU prefill: failed to transfer sequence state");
+            }
+        }
+    }
+
+    // run the prompt tokens [i0, batch.size() - 1) of the slot on the NPU context, the
+    // last token stays in the batch and is processed by ctx_tgt as usual
+    void npu_offload_prompt(server_slot & slot, int32_t i0) {
+        if (!ctx_npu) {
+            return;
+        }
+        const int32_t n_end = batch.size();
+        const int32_t n_off = n_end - 1 - i0;
+        if (n_off < npu_min_tokens) {
+            return;
+        }
+        for (int32_t i = i0; i < n_end; i++) {
+            const auto & t = batch.tokens[i];
+            if (t.id_slot != slot.id || !t.is_prompt || t.i_embd >= 0 || t.decision_order != 0) {
+                return;
+            }
+            if (t.output && i != n_end - 1) {
+                return;
+            }
+        }
+        if (!lora_get_enabled_ids(slot.lora).empty()) {
+            return;
+        }
+
+        const llama_seq_id seq = slot.id;
+        const int64_t t0 = ggml_time_us();
+
+        int ret = 0;
+        queue_tasks.yield_to_queue([&]() {
+            copy_seq_state(ctx_tgt, ctx_npu, seq);
+            const int64_t t1 = ggml_time_us();
+
+            const int32_t nb = llama_n_batch(ctx_npu);
+            for (int32_t off = i0; off < i0 + n_off && ret == 0; off += nb) {
+                const int32_t n = std::min(nb, i0 + n_off - off);
+                npu_batch.clear();
+                for (int32_t i = off; i < off + n; i++) {
+                    const auto & t = batch.tokens[i];
+                    npu_batch.add(t.token, t.pos[0], seq, false);
+                }
+                ret = llama_process(ctx_npu, LLAMA_PROCESS_TYPE_DECODE, npu_batch.get());
+            }
+            if (ret != 0) {
+                return;
+            }
+            llama_synchronize(ctx_npu);
+            const int64_t t2 = ggml_time_us();
+
+            copy_seq_state(ctx_npu, ctx_tgt, seq);
+            const int64_t t3 = ggml_time_us();
+
+            SLT_INF(slot, "NPU prefill: %d tokens in %.1f ms (%.1f t/s), state sync %.1f + %.1f ms\n",
+                    n_off, (t2 - t1) / 1e3, n_off / ((t2 - t1) / 1e6), (t1 - t0) / 1e3, (t3 - t2) / 1e3);
+        });
+
+        if (ret != 0) {
+            SLT_WRN(slot, "NPU prefill failed (ret = %d), falling back to the main context\n", ret);
+            return;
+        }
+
+        const auto last = batch.tokens[n_end - 1];
+        batch.truncate(i0);
+        batch.tokens.push_back(last);
+        if (slot.state == SLOT_STATE_DONE_PROMPT) {
+            slot.i_batch = batch.size() - 1;
+        }
+
+        if (slot.stats.is_set()) {
+            slot.stats.n_prompt_processed += n_off;
+        }
+        metrics_queue_prompt(n_off);
+    }
+
     bool load_model(common_params & params) {
         load_progress_data load_progress_text  (this, "text_model");
         load_progress_data load_progress_mmproj(this, "mmproj_model");
@@ -1321,6 +1486,10 @@ private:
         }
 
         vocab = llama_model_get_vocab(model_tgt);
+
+        if (!load_npu_prefill()) {
+            return false;
+        }
 
         try {
             decision.init(model_tgt);
@@ -4609,6 +4778,10 @@ private:
                     //       yet processed and therefore it is not part of the checkpoint.
                     if (do_checkpoint) {
                         create_checkpoint(slot, n_tokens_cur, pos_min, pos_max);
+                    }
+
+                    if (!has_mtmd && alora_scale <= 0.0f) {
+                        npu_offload_prompt(slot, n_tokens_prev);
                     }
                 }
 

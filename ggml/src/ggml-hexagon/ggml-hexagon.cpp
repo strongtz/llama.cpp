@@ -3690,7 +3690,7 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
     size_t MiB = 1024 * 1024;
 
     // Update vmem default
-    opt_vmem  = opt_arch >= 75 ? HTP_OP_MAX_VMEM_DEFAULT : 3000 * MiB;
+    opt_vmem  = opt_arch >= 75 ? HTP_OP_MAX_VMEM_DEFAULT : (opt_arch < 73 ? 2304 * MiB : 3000 * MiB);
     opt_dma64 = opt_arch > 79 && (!str_dma64 || atoi(str_dma64) != 0);
 
     auto RE_ICASE = std::regex_constants::icase;
