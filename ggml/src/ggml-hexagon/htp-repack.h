@@ -3,6 +3,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <stdlib.h>
 
 #include "ggml.h"
 #include "htp/htp-tensor.h"
@@ -27,7 +28,10 @@ static inline bool htp_is_tiled_weight_tensor(const struct ggml_tensor * t) {
     if (!ggml_is_contiguous(t) || ggml_is_view(t)) {
         return false;
     }
-    if (t->ne[0] < 32 || (t->ne[0] % 32 != 0) || t->ne[3] != 1) {
+    // float weights: K is zero-padded to a multiple of 32 in the tiles (e.g. the 4304-wide ViT ffn_down)
+    const bool is_float = t->type == GGML_TYPE_F16 || t->type == GGML_TYPE_F32 || t->type == GGML_TYPE_BF16;
+    static const bool pad_k = !getenv("GGML_HEXAGON_PAD_K") || atoi(getenv("GGML_HEXAGON_PAD_K")) != 0;
+    if (t->ne[0] < 32 || (t->ne[0] % 32 != 0 && !(is_float && pad_k)) || t->ne[3] != 1) {
         return false;
     }
     if (!ggml_is_quantized(t->type)) {

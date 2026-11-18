@@ -635,11 +635,11 @@ static bool htp_matmul_is_hmx_eligible(
         return false;
     }
 
-    if (ne00 % HTP_TENSOR_TILE_N_COLS != 0) {
+    const bool is_tiled = ggml_hexagon_tensor_will_tile(src0);
+    // float weights are tiled with K zero-padded to a multiple of 32
+    if (ne00 % HTP_TENSOR_TILE_N_COLS != 0 && !(is_tiled && !ggml_is_quantized((ggml_type) wtype))) {
         return false;
     }
-
-    const bool is_tiled = ggml_hexagon_tensor_will_tile(src0);
     if (ggml_is_quantized((ggml_type) wtype) && !is_tiled) {
         return false;
     }
@@ -942,6 +942,10 @@ static bool htp_kparams_solve_matmul_impl(
     }
 
     htp_kparams_solve_hvx_mm(sess, src0, src1, dst, wtype, is_tiled, ne02, ne03, ne10, ne11, ne12, ne13, is_matmul_id, src2_row_size, vtcm_budget, kparams);
+    if (is_tiled && ne00 % 32 != 0) {
+        // K-padded float tiles are only handled by the HMX kernels
+        kparams->kernel_type = HTP_MM_KERNEL_UNSUPPORTED;
+    }
 
 finalize:
     kparams->div_ne12_ne1 = init_fastdiv_values(ne12 * ne11);

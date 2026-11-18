@@ -3911,7 +3911,8 @@ static int hmx_mm_id_2d_f32(struct htp_context *ctx,
 static int hmx_mm_op_matmul(struct htp_ops_context * octx, const struct htp_mm_kernel_params * kparams) {
     htp_matmul_tensors_preamble;
 
-    int k = (int) src0->ne[0];
+    // tiled weights are zero-padded to whole K tiles (float weights with K % 32 != 0); act->ne[0] stays the valid K
+    int k = kparams->tile_size ? (int) hex_align_up(src0->ne[0], 32) : (int) src0->ne[0];
     int n = (int) src0->ne[1];
     const int m_total    = (int) act->ne[1];
     const uint32_t act_elem_size = (act->type == HTP_TYPE_F16) ? sizeof(__fp16) : sizeof(float);

@@ -13509,6 +13509,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                 test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, mk.first, n, mk.second, {1, 1}, {1, 1}));
             }
         }
+        // ViT (Qwen3.5 mmproj) shapes, K not a multiple of 32
+        for (auto mk : std::vector<std::pair<int,int>>{{1152, 4304}, {4304, 1152}, {1152, 1152}}) {
+            for (int n : {2280, 512, 33, 4, 1}) {
+                test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, mk.first, n, mk.second, {1, 1}, {1, 1}));
+            }
+        }
     }
     return test_cases;
 }

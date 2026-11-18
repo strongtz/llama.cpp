@@ -910,7 +910,10 @@ static int encode_mtmd_chunk(const server_slot & slot, mtmd::batch_ptr & mbatch,
 // note: this is not a member of server_slot because we want to run it inside yield_to_queue
 //       slot is passed as const to avoid accidental modification of the slot state
 //       some pointers are allowed to be used, they are not used by to_json()
-static int process_mtmd_chunk(const server_slot & slot, mtmd::batch_ptr & mbatch, size_t idx, size_t & n_tokens_out) {
+// ctx_dec: context that decodes the embeddings (nullptr: slot.ctx_tgt); the speculative callback only runs for ctx_tgt
+static int process_mtmd_chunk(const server_slot & slot, mtmd::batch_ptr & mbatch, size_t idx, size_t & n_tokens_out,
+                              llama_context * ctx_dec = nullptr) {
+    llama_context * lctx = ctx_dec ? ctx_dec : slot.ctx_tgt;
     GGML_ASSERT(slot.mctx);
     const auto & mctx = slot.mctx;
     const auto & input_tokens = slot.task->tokens;
@@ -942,17 +945,18 @@ static int process_mtmd_chunk(const server_slot & slot, mtmd::batch_ptr & mbatch
                 };
 
                 llama_pos new_n_past; // unused for now
+                const bool on_tgt = lctx == slot.ctx_tgt;
                 res = mtmd_helper_decode_image_chunk(
                     mctx,
-                    slot.ctx_tgt,
+                    lctx,
                     chunk.get(),
                     embd,
                     slot.prompt.tokens.pos_next(),
                     slot.id,
-                    llama_n_batch(slot.ctx_tgt),
+                    llama_n_batch(lctx),
                     &new_n_past,
-                    cb,
-                    &cb_data
+                    on_tgt ? cb : nullptr,
+                    on_tgt ? &cb_data : nullptr
                 );
                 if (res != 0) {
                     SLT_ERR(slot, "failed to decode mtmd chunk, idx = %zu, res = %d\n", idx, res);
@@ -4784,8 +4788,26 @@ private:
                         // encode on the worker thread, so we can still handle metrics tasks
                         size_t n_tokens_out = 0;
                         int32_t res = 0;
+                        // large media chunks (images) are decoded on the NPU prefill context
+                        const bool npu_media = ctx_npu && lora_get_enabled_ids(slot.lora).empty() &&
+                            (int32_t) mtmd_input_chunk_get_n_tokens(input_tokens.find_chunk(cur_token_idx).get()) >= npu_min_tokens;
                         queue_tasks.yield_to_queue([&]() {
-                            res = process_mtmd_chunk(slot, slot.mbatch, cur_token_idx, n_tokens_out);
+                            if (!npu_media) {
+                                res = process_mtmd_chunk(slot, slot.mbatch, cur_token_idx, n_tokens_out);
+                                return;
+                            }
+                            const int64_t t0 = ggml_time_us();
+                            copy_seq_state(ctx_tgt, ctx_npu, slot.id);
+                            const int64_t t1 = ggml_time_us();
+                            res = process_mtmd_chunk(slot, slot.mbatch, cur_token_idx, n_tokens_out, ctx_npu);
+                            if (res == 0) {
+                                llama_synchronize(ctx_npu);
+                                const int64_t t2 = ggml_time_us();
+                                copy_seq_state(ctx_npu, ctx_tgt, slot.id);
+                                const int64_t t3 = ggml_time_us();
+                                SLT_INF(slot, "NPU media chunk: %zu tokens in %.1f ms (encode + decode), state sync %.1f + %.1f ms\n",
+                                        n_tokens_out, (t2 - t1) / 1e3, (t1 - t0) / 1e3, (t3 - t2) / 1e3);
+                            }
                         });
 
                         if (res != 0) {
