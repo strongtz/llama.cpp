@@ -102,6 +102,8 @@ struct htp_context {
 
     uint8_t *              vtcm_base;
     size_t                 vtcm_size;
+    uint8_t *              vtcm_aux_base;   // extra VTCM not usable by HMX (v68 second page), may be NULL
+    size_t                 vtcm_aux_size;
     uint32_t               vtcm_rctx;
     atomic_bool            vtcm_valid;
     atomic_bool            vtcm_needs_release;

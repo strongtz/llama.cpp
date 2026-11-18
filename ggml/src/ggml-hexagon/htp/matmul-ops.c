@@ -2295,7 +2295,8 @@ static void transfer_activation_chunk_gathered_worker_fn(const htp_thread_t * th
     int chunk_size     = st->n_chunks_per_task;
     int vtcm_start_row = chunk_idx * chunk_size;
     int start_row      = st->start_row + vtcm_start_row;
-    int n_rows         = hex_smin(st->cne1 - start_row, chunk_size);
+    int n_rows         = (int) st->n_tot_chunks - vtcm_start_row;
+    if (n_rows > chunk_size) n_rows = chunk_size;
     if (n_rows > 0) {
         htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_A_PREP, chunk_idx);
         transfer_activation_chunk_fp32_to_fp16_gathered(
@@ -2313,7 +2314,8 @@ static void transfer_activation_chunk_gathered_worker_flat_fn(const htp_thread_t
     int chunk_size = st->n_chunks_per_task;
     int vtcm_start_row = chunk_idx * chunk_size;
     int start_row = st->start_row + vtcm_start_row;
-    int n_rows = hex_smin(st->cne1 - start_row, chunk_size);
+    int n_rows = (int) st->n_tot_chunks - vtcm_start_row;
+    if (n_rows > chunk_size) n_rows = chunk_size;
     if (n_rows > 0) {
         htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_A_PREP, chunk_idx);
         transfer_activation_chunk_fp32_to_fp16_gathered_flat(
@@ -2346,7 +2348,11 @@ static void transfer_output_chunk_scattered_worker_fn(const htp_thread_t * th, u
 
 static inline tiled_dequant_task_fn_t hmx_get_dequant_worker_fn(int weight_type, bool is_tiled) {
     switch (weight_type) {
+#if __HVX_ARCH__ < 73
+        case HTP_TYPE_Q4_0:   return dequantize_tiled_weight_to_fp16_task_q4_0_lut;
+#else
         case HTP_TYPE_Q4_0:   return dequantize_tiled_weight_to_fp16_task_q4_0;
+#endif
         case HTP_TYPE_IQ4_NL: return dequantize_tiled_weight_to_fp16_task_iq4_nl;
         case HTP_TYPE_Q4_1:
         case HTP_TYPE_Q4_K:   return dequantize_tiled_weight_to_fp16_task_q4_1;
@@ -3820,6 +3826,450 @@ int op_matmul(struct htp_ops_context * octx) {
     return op_matmul_impl(octx);
 }
 
+// --- Pipelined MoE (MUL_MAT_ID / MUL_MAT_ID_NX) on HMX ---
+// Jobs are (expert, m-chunk, weight, n-chunk). While HMX computes job j, the HVX threads gather
+// activations / dequantize weights for job j+1 and scatter the output of job j-1; the weight DMA
+// for job j+1 overlaps with the dequant of job j. Activations are gathered once per (expert, m-chunk)
+// and shared by all weights (gate + up).
+
+#ifndef HMX_MOE_PROF
+#define HMX_MOE_PROF 0
+#endif
+#ifndef HMX_MOE_STAGE
+#define HMX_MOE_STAGE 1
+#endif
+#ifndef HMX_MOE_PIPELINE
+#define HMX_MOE_PIPELINE 1
+#endif
+static inline bool hmx_moe_pipeline_enabled(void) { return HMX_MOE_PIPELINE; }
+
+struct hmx_moe_weight {
+    dma_addr_t data;      // expert 0
+    size_t     nb2;       // expert stride
+    float    * dst;
+    size_t     dst_nb1;
+    size_t     dst_nb2;
+};
+
+struct hmx_moe_job {
+    int a;       // expert, -1 = none
+    int mr;      // m-chunk start
+    int n_rows;
+    int p;       // weight index
+    int nc;      // n-chunk start
+    int n_cols;
+};
+
+static inline bool hmx_moe_next(struct hmx_moe_job * j, const uint32_t * counts, int n_as, int n_w, int n, int M, int NC) {
+    if (j->a >= 0) {
+        j->nc += NC;
+        if (j->nc < n) goto fill;
+        j->nc = 0;
+        if (++j->p < n_w) goto fill;
+        j->p = 0;
+        j->mr += M;
+        if (j->mr < (int) counts[j->a]) goto fill;
+    }
+    j->mr = 0; j->p = 0; j->nc = 0;
+    for (++j->a; j->a < n_as; ++j->a) {
+        if (counts[j->a] > 0) goto fill;
+    }
+    j->a = -1;
+    return false;
+fill:
+    j->n_rows = (int) counts[j->a] - j->mr;
+    if (j->n_rows > M) j->n_rows = M;
+    j->n_cols = n - j->nc;
+    if (j->n_cols > NC) j->n_cols = NC;
+    return true;
+}
+
+static inline bool hmx_moe_next_group(int * a, int * mr, const uint32_t * counts, int n_as, int M) {
+    *mr += M;
+    if (*mr < (int) counts[*a]) return true;
+    *mr = 0;
+    for (++*a; *a < n_as; ++*a) {
+        if (counts[*a] > 0) return true;
+    }
+    return false;
+}
+
+// DMA rows [r0, r1) of a group (one row per routed token) into a VTCM staging area (f32,
+// row_bytes stride). Descriptors are chained in memory and linked with a single dmlink.
+// Must be called from the hardware thread owning q. Caller guarantees queue room.
+static inline void hmx_moe_stage_rows(dma_queue * q, uint8_t * stage, uint32_t row_bytes, const float * act,
+                                      const struct mmid_row_mapping * mp, int r0, int r1,
+                                      int ne11, size_t nb11, size_t nb12, int k_valid) {
+    dma_ring * r = q->ring0;
+    dma_descriptor_1d * first = NULL;
+    dma_descriptor_1d * prev  = NULL;
+    for (int i = r0; i < r1; ++i) {
+        const uint32_t i11 = (ne11 == 1) ? 0 : (mp[i].i1 % (uint32_t) ne11);
+        const uint8_t * src = (const uint8_t *) act + i11 * nb11 + mp[i].i2 * nb12;
+        uint8_t * dst = stage + i * row_bytes;
+        const uint32_t idx = r->push_idx;
+        dma_descriptor_1d * d = (dma_descriptor_1d *) &r->desc[idx];
+        d->next       = NULL;
+        d->size       = k_valid * sizeof(float);
+        d->desc_size  = 0;
+        d->dst_comp   = 0;
+        d->src_comp   = 0;
+        d->src_bypass = dma_bypass_for((dma_addr_t) src);
+        d->dst_bypass = 0;   // VTCM
+        d->order      = 0;
+        d->done       = 0;
+        d->src        = (uint32_t) (uintptr_t) src;
+        d->dst        = (uint32_t) (uintptr_t) dst;
+        r->data[idx]  = dma_make_data(dst, src);
+        if (prev) {
+            prev->next = d;
+        } else {
+            first = d;
+        }
+        prev = d;
+        r->push_idx = (idx + 1) & r->idx_mask;
+    }
+    if (first) {
+        dmlink(r->tail, first);
+        r->tail = (dma_descriptor_2d *) prev;
+    }
+}
+
+static inline uint32_t hmx_moe_rows_per_task(uint32_t n_valid, uint32_t n_hvx) {
+    const uint32_t n_out = hex_align_up(n_valid, 32);
+    return hex_align_up((n_out + n_hvx - 1) / n_hvx, 2);
+}
+
+typedef struct {
+    __fp16        * dst;            // NULL: push only
+    const uint8_t * src;
+    uint32_t        row_bytes;
+    uint32_t        n_valid;
+    uint32_t        n_out;
+    uint32_t        k_block;
+    uint32_t        k_valid;
+    uint32_t        rows_per_task;
+    // next group to stage (n_next == 0: none)
+    uint8_t                       * next_stage;
+    const struct mmid_row_mapping * next_map;
+    uint32_t                        n_next;
+    uint32_t                        rpt_next;
+    const float                   * act;
+    int                             ne11;
+    size_t                          nb11;
+    size_t                          nb12;
+    // worker 0 shares the main thread's DMA queue, its descriptors are tracked by the caller
+    dma_queue                     * q0;
+} hmx_moe_stage_cvt_t;
+
+static void hmx_moe_stage_cvt_worker(const htp_thread_t * th, unsigned int n, unsigned int ith, void * data) {
+    (void) n;
+    const hmx_moe_stage_cvt_t * st = (const hmx_moe_stage_cvt_t *) data;
+    struct htp_thread_trace * tr = th->trace;
+    dma_queue * q = (ith == 0) ? st->q0 : th->dma_q;
+    if (ith != 0 && st->dst) {
+        dma_queue_flush(q);   // this worker's rows of the current group
+    }
+    if (st->n_next) {
+        int n0 = (int) (ith * st->rpt_next);
+        int n1 = n0 + (int) st->rpt_next;
+        if (n1 > (int) st->n_next) n1 = (int) st->n_next;
+        if (n0 < n1) {
+            hmx_moe_stage_rows(q, st->next_stage, st->row_bytes, st->act, st->next_map, n0, n1,
+                               st->ne11, st->nb11, st->nb12, st->k_valid);
+        }
+    }
+    if (!st->dst) return;
+    const uint32_t r_begin = ith * st->rows_per_task;
+    uint32_t r_end = r_begin + st->rows_per_task;
+    if (r_end > st->n_out) r_end = st->n_out;
+    if (r_begin >= r_end) return;
+    htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_A_PREP, ith);
+    const uint32_t k_tiles = st->k_block / HTP_MM_HMX_TILE_N_COLS;
+    const HVX_Vector zero = Q6_V_vzero();
+    for (uint32_t r = r_begin; r < r_end; r += 2) {
+        const uint32_t r0 = r / HTP_MM_HMX_TILE_N_ROWS;
+        const uint32_t r1 = r % HTP_MM_HMX_TILE_N_ROWS;
+        const bool v0ok = r < st->n_valid;
+        const bool v1ok = r + 1 < st->n_valid;
+        const HVX_Vector * row0 = (const HVX_Vector *) (st->src + r * st->row_bytes);
+        const HVX_Vector * row1 = (const HVX_Vector *) (st->src + (r + 1) * st->row_bytes);
+        HVX_Vector * out = (HVX_Vector *) (st->dst + r0 * k_tiles * HTP_MM_HMX_TILE_N_ELMS) + r1 / 2;
+        uint32_t c = 0;
+        if (v0ok && v1ok) {
+            #pragma unroll(4)
+            for (; c + 32 <= st->k_valid; c += 32) {
+                out[(c / 32) * (HTP_MM_HMX_TILE_N_ELMS / 64)] = hvx_vec_f32_to_f16_shuff(row0[c / 32], row1[c / 32]);
+            }
+        }
+        for (; c < st->k_block; c += 32) {
+            HVX_Vector v0 = (v0ok && c < st->k_valid) ? row0[c / 32] : zero;
+            HVX_Vector v1 = (v1ok && c < st->k_valid) ? row1[c / 32] : zero;
+            if (c + 32 > st->k_valid) {
+                const uint32_t rem = st->k_valid > c ? st->k_valid - c : 0;
+                HVX_VectorPred mask = Q6_Q_vsetq2_R(rem * sizeof(float));
+                v0 = Q6_V_vmux_QVV(mask, v0, zero);
+                v1 = Q6_V_vmux_QVV(mask, v1, zero);
+            }
+            out[(c / 32) * (HTP_MM_HMX_TILE_N_ELMS / 64)] = hvx_vec_f32_to_f16_shuff(v0, v1);
+        }
+    }
+    htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_A_PREP, ith);
+}
+
+static int hmx_mm_id_pipelined(struct htp_context * ctx,
+                               dma_queue * dma,
+                               const struct hmx_moe_weight * ws,
+                               int n_w,
+                               const float * act,
+                               int k, int n, int k_valid,
+                               int ne11, size_t act_nb1, size_t act_nb2,
+                               int weight_stride, int weight_type,
+                               int tile_size, int aligned_tile_size,
+                               const uint32_t * counts,
+                               const struct mmid_row_mapping * matrix_rows,
+                               int mapping_stride, int n_as, int n_hvx) {
+    struct htp_thread_trace * tr = &ctx->trace[0];
+    htp_trace_event_start(tr, HTP_TRACE_EVT_INIT, 1);
+
+    if (k % 32 != 0 || n % 32 != 0 || tile_size <= 0) return -1;
+    if (!hex_is_aligned(act, VLEN)) return -1;
+    if (htp_mm_hmx_lut_bytes(weight_type) != 0) return -1;
+    tiled_dequant_task_fn_t dequant_fn = hmx_get_dequant_worker_fn(weight_type, true);
+    if (!dequant_fn) return -1;
+
+    const size_t row_stride = htp_tensor_get_row_size(weight_type, k);
+    if (row_stride == 0) return -1;
+
+    const int n_k_tiles = k / HTP_MM_HMX_TILE_N_COLS;
+    const uint32_t n_weight_tiles = k / htp_tensor_get_tile_k(weight_type);
+    const struct fastdiv_values n_k_tiles_div = init_fastdiv_values(n_k_tiles);
+    const size_t raw_per_col = (size_t) n_weight_tiles * aligned_tile_size / 32;
+    const size_t w_per_col   = (size_t) k * sizeof(__fp16);
+
+    uint32_t max_rows = 0;
+    for (int a = 0; a < n_as; ++a) max_rows = MAX(max_rows, counts[a]);
+    if (max_rows == 0) return 0;
+
+    // VTCM: 3x raw weight, 2x fp16 weight, 2x activation, 2x output, scales.
+    // Prefer covering all rows of an expert in one m-chunk (weights are dequantized once per
+    // m-chunk, dequant is the bottleneck), then the widest n-chunk that divides n evenly.
+    const size_t budget = ctx->vtcm_size;
+    int M = 0, NC = 0;
+    uint64_t best_cost = UINT64_MAX;
+    int m_max = (int) hex_align_up(max_rows, 32);
+    const uint32_t stage_row_bytes = hex_align_up((size_t) k_valid * sizeof(float), 128);
+    const bool use_stage = HMX_MOE_STAGE && ctx->vtcm_aux_base != NULL && n_hvx > 1 && ctx->n_threads > 1 &&
+                           ctx->vtcm_aux_size >= 2 * 32 * stage_row_bytes && dma_queue_capacity(dma) >= 64;
+    if (use_stage) {
+        int m_cap = (int) (ctx->vtcm_aux_size / (2 * stage_row_bytes)) & ~31;
+        const int q_room = (int) dma_queue_capacity(dma) - 8;   // rows of one group + weight look-ahead
+        if (m_cap > q_room) m_cap = q_room & ~31;
+        if (m_max > m_cap) m_max = m_cap;
+    }
+    for (int m_try = 32; m_try <= m_max; m_try += 32) {
+        for (int d = 1; n / d >= 32; ++d) {
+            const int nc = n / d;
+            if (nc % 32 != 0 || n % d != 0) continue;
+            const size_t r_  = hex_align_up((size_t) nc * raw_per_col, HTP_MM_HMX_TILE_SIZE);
+            const size_t w_  = hex_align_up((size_t) nc * w_per_col, HTP_MM_HMX_TILE_SIZE);
+            const size_t a_  = hex_align_up((size_t) m_try * w_per_col, HTP_MM_HMX_TILE_SIZE);
+            const size_t o_  = hex_align_up((size_t) m_try * nc * sizeof(__fp16), HTP_MM_HMX_TILE_SIZE);
+            if (3 * r_ + 2 * (w_ + a_ + o_) + 256 > budget) continue;
+            // cost in dequantized weights: one dequant of the full weight per (expert, m-chunk)
+            // plus a fixed per-job overhead (thread dispatch, small HMX jobs)
+            uint64_t n_mchunks = 0;
+            for (int a = 0; a < n_as; ++a) n_mchunks += (counts[a] + m_try - 1) / m_try;
+            const uint64_t cost = n_mchunks * ((uint64_t) n * k + (uint64_t) d * 65536);
+            if (cost < best_cost) {
+                best_cost = cost;
+                M  = m_try;
+                NC = nc;
+            }
+            break;  // widest fitting n-chunk for this m
+        }
+    }
+    if (NC == 0) return -1;
+    const size_t raw_sz = hex_align_up((size_t) NC * raw_per_col, HTP_MM_HMX_TILE_SIZE);
+    const size_t w_sz   = hex_align_up((size_t) NC * w_per_col, HTP_MM_HMX_TILE_SIZE);
+    const size_t a_sz   = hex_align_up((size_t) M * w_per_col, HTP_MM_HMX_TILE_SIZE);
+    const size_t o_sz   = hex_align_up((size_t) M * NC * sizeof(__fp16), HTP_MM_HMX_TILE_SIZE);
+
+    uint8_t * vp = (uint8_t *) ctx->vtcm_base;
+    __fp16 * wbuf[2], * abuf[2], * obuf[2];
+    void   * raw[3];
+    for (int i = 0; i < 2; ++i) wbuf[i] = (__fp16 *) vtcm_seq_alloc(&vp, w_sz);
+    for (int i = 0; i < 2; ++i) abuf[i] = (__fp16 *) vtcm_seq_alloc(&vp, a_sz);
+    for (int i = 0; i < 2; ++i) obuf[i] = (__fp16 *) vtcm_seq_alloc(&vp, o_sz);
+    for (int i = 0; i < 3; ++i) raw[i]  = vtcm_seq_alloc(&vp, raw_sz);
+    __fp16 * scales = (__fp16 *) vtcm_seq_alloc(&vp, 256);
+    if ((size_t) (vp - (uint8_t *) ctx->vtcm_base) > budget) return -1;
+    hmx_init_column_scales(scales, Q6_V_vsplat_R(0x3c00));
+
+    const uint32_t dma_dst_stride  = aligned_tile_size;
+    const uint32_t dma_src_stride  = tile_size;
+    const uint32_t dma_width_bytes = tile_size;
+
+    htp_trace_event_stop(tr, HTP_TRACE_EVT_INIT, 1);
+
+    struct hmx_moe_job cur = { .a = -1 };
+    if (!hmx_moe_next(&cur, counts, n_as, n_w, n, M, NC)) return 0;
+
+    // all DMA (weights + staged activation rows) goes through one queue: descriptor chains are
+    // per hardware thread. Completion is in order, waits are by sequence number.
+    uint32_t dma_pushed = 0, dma_popped = 0;
+    uint32_t wseq[3] = { 0, 0, 0 };
+#define MOE_DMA_WAIT(SEQ) do { while (dma_popped <= (SEQ)) { dma_queue_pop(dma); ++dma_popped; } } while (0)
+#define MOE_PUSH_DMA(J, SLOT) do { \
+        const uint32_t h_ = hmx_ceil_div((J).n_cols, 32) * n_weight_tiles; \
+        const uint32_t d0_ = dma_queue_depth(dma); \
+        dma_queue_push(dma, dma_make_data(raw[(SLOT)], ws[(J).p].data + (size_t) (J).a * ws[(J).p].nb2 + (size_t) (J).nc * weight_stride), \
+                       dma_dst_stride, dma_src_stride, dma_width_bytes, h_); \
+        dma_pushed += dma_queue_depth(dma) - d0_; \
+        wseq[(SLOT)] = dma_pushed - 1; \
+    } while (0)
+
+    MOE_PUSH_DMA(cur, 0);
+    // DMA runs two jobs ahead
+    struct hmx_moe_job ahead = cur;
+    bool has_ahead = hmx_moe_next(&ahead, counts, n_as, n_w, n, M, NC);
+    if (has_ahead) {
+        MOE_PUSH_DMA(ahead, 1);
+    }
+
+    hmx_matmul_job_t hjob[2];
+    uint8_t * stage[2] = { NULL, NULL };
+    int stage_slot = 0, staged_rows = 0, grp_a = cur.a, grp_mr = cur.mr;
+    uint32_t stage_seq = 0;
+    hmx_moe_stage_cvt_t cst;
+    memset(&cst, 0, sizeof(cst));
+    if (use_stage) {
+        stage[0] = ctx->vtcm_aux_base;
+        stage[1] = ctx->vtcm_aux_base + (size_t) M * stage_row_bytes;
+        cst.row_bytes = stage_row_bytes;
+        cst.k_block   = k;
+        cst.k_valid   = k_valid;
+        cst.act       = act;
+        cst.ne11      = ne11;
+        cst.nb11      = act_nb1;
+        cst.nb12      = act_nb2;
+        cst.q0        = dma;
+        // stage group 0 (push only)
+        staged_rows = hex_smin((size_t) ((int) counts[grp_a] - grp_mr), (size_t) M);
+        cst.dst        = NULL;
+        cst.next_stage = stage[0];
+        cst.next_map   = matrix_rows + grp_a * mapping_stride + grp_mr;
+        cst.n_next     = staged_rows;
+        cst.rpt_next   = hmx_moe_rows_per_task(staged_rows, n_hvx);
+        work_queue_run(ctx->hvx_queue, hmx_moe_stage_cvt_worker, &cst, n_hvx);
+        dma_pushed = dma_popped + dma_queue_depth(dma);
+        stage_seq  = dma_pushed - 1;
+    }
+    uint64_t tpush = 0, tsw = 0, tg = 0, tdma = 0, tdq = 0, thmx = 0, tsc = 0, t0, t1;
+    struct hmx_moe_job prev = { .a = -1 };
+    int act_slot = -1;
+    int j = 0;
+    while (cur.a >= 0) {
+        struct hmx_moe_job nxt = cur;
+        const bool has_next = hmx_moe_next(&nxt, counts, n_as, n_w, n, M, NC);
+
+        // new (expert, m-chunk): gather activations into the other buffer
+        if (cur.p == 0 && cur.nc == 0) {
+            act_slot = (act_slot + 1) & 1;
+            t0 = hex_get_cycles();
+            if (use_stage) {
+                MOE_DMA_WAIT(stage_seq);   // worker 0's rows (and anything older on the main queue)
+                tsw += hex_get_cycles() - t0;
+                const uint64_t tp0 = hex_get_cycles();
+                const int cur_rows = staged_rows;
+                cst.dst           = abuf[act_slot];
+                cst.src           = stage[stage_slot];
+                cst.n_valid       = cur_rows;
+                cst.n_out         = hex_align_up(cur_rows, 32);
+                cst.rows_per_task = hmx_moe_rows_per_task(cur_rows, n_hvx);
+                stage_slot ^= 1;
+                staged_rows = 0;
+                cst.n_next = 0;
+                if (hmx_moe_next_group(&grp_a, &grp_mr, counts, n_as, M)) {
+                    staged_rows    = hex_smin((size_t) ((int) counts[grp_a] - grp_mr), (size_t) M);
+                    cst.next_stage = stage[stage_slot];
+                    cst.next_map   = matrix_rows + grp_a * mapping_stride + grp_mr;
+                    cst.n_next     = staged_rows;
+                    cst.rpt_next   = hmx_moe_rows_per_task(staged_rows, n_hvx);
+                }
+                work_queue_run(ctx->hvx_queue, hmx_moe_stage_cvt_worker, &cst, n_hvx);
+                if (staged_rows > 0) {
+                    dma_pushed = dma_popped + dma_queue_depth(dma);
+                    stage_seq  = dma_pushed - 1;
+                }
+                tpush += hex_get_cycles() - tp0;
+            } else {
+                transfer_activation_chunk_gathered_threaded(
+                    ctx, abuf[act_slot], act, cur.mr, hex_align_up(cur.n_rows, 32), k,
+                    matrix_rows, cur.a, mapping_stride, ne11, act_nb1, act_nb2, (int) counts[cur.a], n_hvx, k_valid);
+            }
+            tg += hex_get_cycles() - t0;
+        }
+
+        t0 = hex_get_cycles();
+        MOE_DMA_WAIT(wseq[j % 3]);
+        void * cur_raw = raw[j % 3];
+        t1 = hex_get_cycles(); tdma += t1 - t0;
+        if (has_ahead) {
+            has_ahead = hmx_moe_next(&ahead, counts, n_as, n_w, n, M, NC);
+            if (has_ahead) {
+                MOE_PUSH_DMA(ahead, (j + 2) % 3);
+            }
+        }
+
+        dequantize_tiled_weight_chunk_to_fp16_tiles(
+            ctx, wbuf[j & 1], cur_raw, cur.n_cols, k, row_stride, weight_type,
+            n_k_tiles, n_k_tiles_div, dequant_fn, n_hvx);
+        t0 = hex_get_cycles(); tdq += t0 - t1;
+
+        if (prev.a >= 0) {
+            hmx_queue_pop(ctx->hmx_queue);
+        }
+        t1 = hex_get_cycles(); thmx += t1 - t0;
+
+        hmx_matmul_job_init(&hjob[j & 1], obuf[j & 1], abuf[act_slot], wbuf[j & 1], scales,
+                            hmx_ceil_div(cur.n_rows, HTP_MM_HMX_TILE_N_ROWS),
+                            hmx_ceil_div(cur.n_cols, HTP_MM_HMX_TILE_N_COLS), k / HTP_MM_HMX_TILE_N_ROWS);
+        hmx_queue_push(ctx->hmx_queue, hmx_queue_make_desc(hmx_matmul_worker_fn, &hjob[j & 1]));
+
+        if (prev.a >= 0) {
+            const struct hmx_moe_weight * w = &ws[prev.p];
+            transfer_output_chunk_scattered_threaded(
+                ctx, w->dst + prev.nc, obuf[(j + 1) & 1], prev.mr, hex_align_up(prev.n_rows, 32), prev.n_cols,
+                matrix_rows, prev.a, mapping_stride, w->dst_nb1, w->dst_nb2, (int) counts[prev.a], n_hvx);
+        }
+        tsc += hex_get_cycles() - t1;
+
+        prev = cur;
+        cur  = nxt;
+        if (!has_next) cur.a = -1;
+        ++j;
+    }
+
+    hmx_queue_pop(ctx->hmx_queue);
+    while (dma_popped < dma_pushed) { dma_queue_pop(dma); ++dma_popped; }
+    {
+        const struct hmx_moe_weight * w = &ws[prev.p];
+        transfer_output_chunk_scattered_threaded(
+            ctx, w->dst + prev.nc, obuf[(j + 1) & 1], prev.mr, hex_align_up(prev.n_rows, 32), prev.n_cols,
+            matrix_rows, prev.a, mapping_stride, w->dst_nb1, w->dst_nb2, (int) counts[prev.a], n_hvx);
+    }
+#undef MOE_PUSH_DMA
+#undef MOE_DMA_WAIT
+#if HMX_MOE_PROF
+    FARF(ALWAYS, "moe-prof: nw %d M %d NC %d jobs %d push %u stagewait %u gather %u dma %u dequant %u hmxwait %u scatter %u", n_w, M, NC, j, (unsigned) (tpush >> 10), (unsigned) (tsw >> 10),
+         (unsigned) (tg >> 10), (unsigned) (tdma >> 10), (unsigned) (tdq >> 10), (unsigned) (thmx >> 10), (unsigned) (tsc >> 10));
+#else
+    (void) tpush; (void) tsw; (void) tg; (void) tdma; (void) tdq; (void) thmx; (void) tsc;
+#endif
+    return 0;
+}
+
 static int hmx_mm_op_matmul_id(
     struct htp_ops_context * octx,
     struct htp_mm_context * mmctx
@@ -3842,6 +4292,16 @@ static int hmx_mm_op_matmul_id(
         }
     }
     const bool expert_split = mdev_split && (n_active >= octx->ctx->mdev.count);
+
+    if (octx->ctx->mdev.count <= 1 && hmx_moe_pipeline_enabled()) {
+        const struct hmx_moe_weight w = { src0->data, nb02, (float *) dst->data, nb1, nb2 };
+        if (hmx_mm_id_pipelined(octx->ctx, octx->ctx->dma[0], &w, 1, (const float *) act->data,
+                                ne00, ne01, ne10, ne11, nb11, nb12, (int) src0->nb[1], (int) src0->type,
+                                kparams->tile_size, kparams->aligned_tile_size,
+                                matrix_row_counts, matrix_rows, mmctx->mapping_stride, n_as, (int) octx->n_hvx) == 0) {
+            return HTP_STATUS_OK;
+        }
+    }
 
     uint32_t target_dev = 0;
     for (uint32_t cur_a = 0; cur_a < (uint32_t) n_as; ++cur_a) {
@@ -4002,6 +4462,32 @@ static int hmx_mm_op_matmul_id_nx(
         }
     }
     const bool expert_split = mdev_split && (n_active >= octx->ctx->mdev.count);
+
+    if (octx->ctx->mdev.count <= 1 && n_weights <= 4 && hmx_moe_pipeline_enabled()) {
+        struct hmx_moe_weight ws[4];
+        bool same = true;
+        for (uint32_t p = 0; p < n_weights; ++p) {
+            const struct htp_tensor * restrict src_w = octx->src[p];
+            const struct htp_tensor * restrict dst   = octx->dsts[p];
+            if (!src_w || !dst || src_w->type != src0->type || src_w->ne[0] != src0->ne[0] ||
+                src_w->ne[1] != src0->ne[1] || src_w->nb[1] != src0->nb[1]) {
+                same = false;
+                break;
+            }
+            ws[p].data    = src_w->data;
+            ws[p].nb2     = src_w->nb[2];
+            ws[p].dst     = (float *) dst->data;
+            ws[p].dst_nb1 = dst->nb[1];
+            ws[p].dst_nb2 = dst->nb[2];
+        }
+        if (same && hmx_mm_id_pipelined(octx->ctx, octx->ctx->dma[0], ws, (int) n_weights, (const float *) act->data,
+                                        src0->ne[0], src0->ne[1], act->ne[0], act->ne[1], act->nb[1], act->nb[2],
+                                        (int) src0->nb[1], (int) src0->type,
+                                        kparams->tile_size, kparams->aligned_tile_size,
+                                        matrix_row_counts, matrix_rows, mmctx->mapping_stride, n_as, (int) octx->n_hvx) == 0) {
+            return HTP_STATUS_OK;
+        }
+    }
 
     uint32_t target_dev = 0;
     for (uint32_t cur_a = 0; cur_a < (uint32_t) n_as; ++cur_a) {

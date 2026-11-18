@@ -13519,6 +13519,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 128, 1024, 512, {16, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 512, 1024, 128, {16, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 128, 1024, 512, {16, 1}, {1, 1}));
+    // weight streaming bandwidth (HMX path, memory bound)
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, 8192, 64, 4096, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 8192, 64, 4096, {1, 1}, {1, 1}));
     // Ling-3.0-tiny decode shapes
     for (auto [m, k] : std::vector<std::pair<int,int>>{{2048,1536},{1536,2048},{512,1536},{4608,1536},{576,1536}}) {
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, m, 1, k, {1, 1}, {1, 1}));

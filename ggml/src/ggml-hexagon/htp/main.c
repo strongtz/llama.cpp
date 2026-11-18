@@ -348,9 +348,11 @@ static int vtcm_alloc(struct htp_context * ctx, uint64_t size_override, bool hmx
         vtcm_size = (unsigned int) size_override;
     }
 #if __HVX_ARCH__ < 73
-    // v68: HMX operands must not straddle a VTCM page, keep everything in a single page
+    // v68: HMX operands must not straddle a VTCM page. The first page is the regular VTCM
+    // (vtcm_base / vtcm_size), the rest is exposed as aux VTCM for HVX / DMA staging only.
+    unsigned int hmx_page = 0;
     if (hmx && vtcm_size > max_page) {
-        vtcm_size = max_page;
+        hmx_page = max_page;
     }
 #else
     (void) hmx;
@@ -382,6 +384,16 @@ static int vtcm_alloc(struct htp_context * ctx, uint64_t size_override, bool hmx
     dma_set_vtcm_range((uint32_t) (uintptr_t) vtcm_ptr, vtcm_size);
     ctx->vtcm_base          = (uint8_t *) vtcm_ptr;
     ctx->vtcm_size          = vtcm_size;
+    ctx->vtcm_aux_base      = NULL;
+    ctx->vtcm_aux_size      = 0;
+#if __HVX_ARCH__ < 73
+    if (hmx_page && vtcm_size > hmx_page) {
+        ctx->vtcm_size     = hmx_page;
+        ctx->vtcm_aux_base = (uint8_t *) vtcm_ptr + hmx_page;
+        ctx->vtcm_aux_size = vtcm_size - hmx_page;
+    }
+    FARF(ALWAYS, "vtcm: base %p size %zu aux %p size %zu", ctx->vtcm_base, ctx->vtcm_size, ctx->vtcm_aux_base, ctx->vtcm_aux_size);
+#endif
     ctx->vtcm_rctx          = rctx;
     atomic_store(&ctx->vtcm_valid, false);
     atomic_store(&ctx->vtcm_needs_release, false);
@@ -396,6 +408,10 @@ static void vtcm_free(struct htp_context * ctx) {
         ctx->vtcm_rctx = 0;
     }
 }
+
+#ifndef HTP_DMA_QUEUE_CAPACITY
+#define HTP_DMA_QUEUE_CAPACITY 512
+#endif
 
 static void htp_main_thread(void * context);
 static void htp_packet_callback(dspqueue_t queue, int error, void * context);
@@ -560,7 +576,7 @@ AEEResult htp_iface_start(remote_handle64 handle, uint32_t sess_id, uint64_t dsp
     size_t size_dma = 0;
     for (uint32_t i = 0; i < n_threads; i++) {
         size_dma  = hex_align_up(size_dma, dma_queue_alignof());
-        size_dma += dma_queue_sizeof(256);
+        size_dma += dma_queue_sizeof(HTP_DMA_QUEUE_CAPACITY);
     }
     offset = offset_dma + size_dma;
 
@@ -695,11 +711,11 @@ AEEResult htp_iface_start(remote_handle64 handle, uint32_t sess_id, uint64_t dsp
 
     // Initialize DMA queues
     uint8_t * dma_ptr_curr = (uint8_t *) ((uintptr_t) block + offset_dma);
-    size_t size_dma_q = dma_queue_sizeof(256);
+    size_t size_dma_q = dma_queue_sizeof(HTP_DMA_QUEUE_CAPACITY);
 
     for (int i = 0; i < ctx->n_threads; i++) {
         dma_ptr_curr = (uint8_t *) hex_align_up((uintptr_t) dma_ptr_curr, dma_queue_alignof());
-        ctx->dma[i] = dma_queue_init(dma_ptr_curr, 256, &ctx->trace[i]);
+        ctx->dma[i] = dma_queue_init(dma_ptr_curr, HTP_DMA_QUEUE_CAPACITY, &ctx->trace[i]);
         dma_ptr_curr += size_dma_q;
     }
 

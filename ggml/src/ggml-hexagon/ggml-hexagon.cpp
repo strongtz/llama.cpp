@@ -1289,6 +1289,7 @@ struct ggml_hexagon_opbatch {
     unsigned int n_tens_max;
     unsigned int n_ops_max;
     size_t       b_vmem_max;
+    size_t       b_vmem_soft;   // batching limit, a single op may still use up to b_vmem_max
 
     void reset() {
         n_bufs = 0;
@@ -1307,7 +1308,9 @@ struct ggml_hexagon_opbatch {
         n_ops_max  = batch_size;
         n_tens_max = std::min<size_t>(n_ops_max * 4 + HTP_OP_MAX_INPUTS + HTP_OP_MAX_OUTPUTS, HTP_OP_MAX_TENSORS);
 
-        b_vmem_max = max_vmem;
+        b_vmem_max  = max_vmem;
+        // with on-demand mapping in a small IOVA window, leave headroom for fragmentation
+        b_vmem_soft = max_vmem;
 
         ops.resize(n_ops_max);
 
@@ -1497,7 +1500,7 @@ struct ggml_hexagon_opbatch {
 
         if ((extra_bufs + n_bufs) > n_bufs_max) return false;
         if (check_tens && (extra_tens + n_tens) > n_tens_max) return false;
-        if ((extra_vmem + b_vmem) > b_vmem_max) return false;
+        if ((extra_vmem + b_vmem) > (empty() ? b_vmem_max : b_vmem_soft)) return false;
 
         return true;
     }
@@ -2086,10 +2089,33 @@ void ggml_hexagon_session::mmap_buffers_budgeted() {
         if (!evict_one()) break;
     }
 
+    // last resort against IOVA fragmentation: unmap everything and map the buffers of this
+    // batch again, largest first
+    auto defrag = [&]() -> bool {
+        if (!flushed) {
+            flush_pending(true);
+            flushed = true;
+        }
+        std::vector<ggml_hexagon_shared_buffer *> cur;
+        for (auto * sbuf : this->buffers) {
+            if (sbuf->pinned) continue;
+            if (sbuf->last_use == now) cur.push_back(sbuf);
+            if (sbuf->mapped) sbuf->unmap();
+        }
+        std::sort(cur.begin(), cur.end(), [](const auto * a, const auto * b) { return a->size() > b->size(); });
+        for (auto * sbuf : cur) {
+            if (!sbuf->try_mmap(true)) return false;
+        }
+        return true;
+    };
+
     for (auto * sbuf : need) {
+        if (sbuf->mapped) continue;
         while (!sbuf->try_mmap(true)) {
             // IOVA fragmentation: free more space and retry
             if (!evict_one()) {
+                HEX_VERBOSE("ggml-hex: %s IOVA defrag (mapped %zu, need %zu)\n", c_name(), this->mapped_vmem, sbuf->size());
+                if (defrag()) break;
                 // nothing left to evict: the IOVA space may still be held by a process that just
                 // exited (released asynchronously by the kernel), retry for a while before failing
                 bool ok = false;
@@ -3697,7 +3723,7 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
     size_t MiB = 1024 * 1024;
 
     // Update vmem default
-    opt_vmem  = opt_arch >= 75 ? HTP_OP_MAX_VMEM_DEFAULT : (opt_arch < 73 ? 2304 * MiB : 3000 * MiB);
+    opt_vmem  = opt_arch >= 75 ? HTP_OP_MAX_VMEM_DEFAULT : (opt_arch < 73 ? 2048 * MiB : 3000 * MiB);
     opt_dma64 = opt_arch > 79 && (!str_dma64 || atoi(str_dma64) != 0);
 
     auto RE_ICASE = std::regex_constants::icase;
