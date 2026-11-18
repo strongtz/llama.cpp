@@ -1309,6 +1309,9 @@ private:
                         overrides.push_back(*o);
                     }
                 }
+                overrides.push_back({ "^output\\.weight$", ggml_backend_cpu_buffer_type() });
+                // token embeddings are only gathered: with mmap both models share the file pages
+                overrides.push_back({ "^token_embd\\.weight$", ggml_backend_cpu_buffer_type() });
                 overrides.push_back({ nullptr, nullptr });
                 mparams.tensor_buft_overrides = overrides.data();
                 SRV_INF("NPU prefill: sharing %zu weight tensors (%.1f MiB) with the GPU model\n", shared.size(), n_bytes / 1048576.0);
@@ -1340,6 +1343,10 @@ private:
         cparams.n_ubatch   = n_ubatch;
         cparams.embeddings = false;
         cparams.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+        // the NPU context never produces logits (the last prompt token is decoded by ctx_tgt):
+        // do not reserve an n_ubatch x n_vocab output
+        cparams.n_outputs_max         = 1;
+        cparams.n_outputs_max_per_seq = 1;
         ctx_npu = llama_init_from_model(model_npu, cparams);
         if (!ctx_npu) {
             SRV_ERR("%s", "NPU prefill: failed to create context\n");
