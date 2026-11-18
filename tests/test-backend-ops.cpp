@@ -5517,7 +5517,7 @@ struct test_mul_mat : public test_case {
     }
 
     double max_nmse_err() override {
-        return 5e-4;
+        static const double e_ = getenv("TBO_MUL_MAT_NMSE") ? atof(getenv("TBO_MUL_MAT_NMSE")) : 5e-4; return e_;
     }
 
     double max_nmse_err(ggml_backend_t backend) override {
@@ -13494,6 +13494,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    for (int nt : {1, 2, 3, 4}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, 4096, nt, 4096, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, 12288, nt, 4096, {1, 1}, {1, 1}));
+    }
     return test_cases;
 }
 #ifdef _MSC_VER
@@ -13522,6 +13526,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     // weight streaming bandwidth (HMX path, memory bound)
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, 8192, 64, 4096, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 8192, 64, 4096, {1, 1}, {1, 1}));
+    // Qwen3.5-9B small-batch decode (speculative verification) shapes
+    for (int nt : {1, 2, 3, 4}) {
+        test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, nt, 1, 1, false, false));
+        test_cases.emplace_back(new test_ssm_conv(GGML_TYPE_F32, {3 + nt, 8192, 1, 1}, {4, 8192, 1, 1}));
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {4, 1}, 4096, nt, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, 12288, nt, 4096, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, 248320, nt, 4096, {1, 1}, {1, 1}));
+    }
     // Ling-3.0-tiny decode shapes
     for (auto [m, k] : std::vector<std::pair<int,int>>{{2048,1536},{1536,2048},{512,1536},{4608,1536},{576,1536}}) {
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, m, 1, k, {1, 1}, {1, 1}));
