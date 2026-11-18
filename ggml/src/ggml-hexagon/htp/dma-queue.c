@@ -1,5 +1,8 @@
 #include "dma-queue.h"
 
+uint32_t dma_vtcm_lo = 0;
+uint32_t dma_vtcm_hi = 0;
+
 #include <stdbool.h>
 #include <stdlib.h>
 #include <string.h>

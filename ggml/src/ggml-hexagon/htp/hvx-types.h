@@ -5,6 +5,7 @@
 #include <stdint.h>
 
 #include <hexagon_types.h>
+#include "hvx-v68-compat.h"
 
 #define SIZEOF_FP32 (4)
 #define SIZEOF_FP16 (2)

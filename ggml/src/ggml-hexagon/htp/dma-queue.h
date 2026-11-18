@@ -174,6 +174,25 @@ static inline unsigned int dmwait(void) {
     return ret;
 }
 
+// On v68/v69 the UDMA engine faults when the cache-bypass bit is set for a VTCM address.
+extern uint32_t dma_vtcm_lo;
+extern uint32_t dma_vtcm_hi;
+
+static inline void dma_set_vtcm_range(uint32_t base, uint32_t size) {
+    dma_vtcm_lo = base;
+    dma_vtcm_hi = base + size;
+}
+
+static inline uint32_t dma_bypass_for(dma_addr_t addr) {
+#if __HVX_ARCH__ < 73
+    uint32_t a = (uint32_t) addr;
+    return (a >= dma_vtcm_lo && a < dma_vtcm_hi) ? 0 : 1;
+#else
+    (void) addr;
+    return 1;
+#endif
+}
+
 static inline dma_data dma_make_data_impl(dma_addr_t dst, dma_addr_t src)
 {
     dma_data d = { dst, src };
@@ -203,8 +222,8 @@ static inline bool dma_ring_push_single_1d(dma_ring * r, dma_data ddata, size_t 
     if (size) {
         desc->next       = NULL;
         desc->desc_size  = 0; // 1D mode
-        desc->src_bypass = 1;
-        desc->dst_bypass = 1;
+        desc->src_bypass = dma_bypass_for(ddata.src);
+        desc->dst_bypass = dma_bypass_for(ddata.dst);
         desc->order      = 0;
         desc->done       = 0;
 
@@ -236,8 +255,8 @@ static inline bool dma_ring_push_single_2d(dma_ring * r, dma_data ddata, size_t 
     desc->next           = NULL;
     desc->reserved1      = 0;
     desc->desc_size      = 1; // 2d mode
-    desc->src_bypass     = 1;
-    desc->dst_bypass     = 1;
+    desc->src_bypass     = dma_bypass_for(ddata.src);
+    desc->dst_bypass     = dma_bypass_for(ddata.dst);
     desc->src_comp       = 0;
     desc->dst_comp       = 0;
     desc->order          = 0;

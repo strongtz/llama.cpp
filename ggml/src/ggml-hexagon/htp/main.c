@@ -317,33 +317,58 @@ static int vtcm_release_callback(unsigned int rctx, void * state) {
     return 0;
 }
 
-static unsigned int vtcm_query_size(void) {
+static unsigned int vtcm_query_size_page(unsigned int * max_page) {
     unsigned int vtcm_size = 8 * 1024 * 1024;  // 8MB default
     unsigned int vtcm_avail;
     compute_res_vtcm_page_t total_layout, avail_layout;
+    memset(&total_layout, 0, sizeof(total_layout));
     // some images (e.g. FuSa cDSP) fail the query when the layout out-params are NULL
     HAP_compute_res_query_VTCM(0, &vtcm_size, &total_layout, &vtcm_avail, &avail_layout);
+    if (max_page) {
+        // VTCM may be split into multiple pages (e.g. v68: 2 x 4MB)
+        unsigned int mp = 0;
+        for (unsigned int i = 0; i < total_layout.page_list_len && i < 8; i++) {
+            if (total_layout.page_list[i].page_size > mp) {
+                mp = total_layout.page_list[i].page_size;
+            }
+        }
+        *max_page = mp ? mp : vtcm_size;
+    }
     return vtcm_size;
 }
 
-static int vtcm_alloc(struct htp_context * ctx, uint64_t size_override) {
-    unsigned int vtcm_size = vtcm_query_size();
+static unsigned int vtcm_query_size(void) {
+    return vtcm_query_size_page(NULL);
+}
+
+static int vtcm_alloc(struct htp_context * ctx, uint64_t size_override, bool hmx) {
+    unsigned int max_page  = 0;
+    unsigned int vtcm_size = vtcm_query_size_page(&max_page);
     if (size_override) {
         vtcm_size = (unsigned int) size_override;
     }
+#if __HVX_ARCH__ < 73
+    // v68: HMX operands must not straddle a VTCM page, keep everything in a single page
+    if (hmx && vtcm_size > max_page) {
+        vtcm_size = max_page;
+    }
+#else
+    (void) hmx;
+#endif
+    unsigned int min_page = vtcm_size < max_page ? vtcm_size : max_page;
 
     compute_res_attr_t attr;
     HAP_compute_res_attr_init(&attr);
     HAP_compute_res_attr_set_serialize(&attr, 0);
     HAP_compute_res_attr_set_cache_mode(&attr, 1);
-    HAP_compute_res_attr_set_vtcm_param_v2(&attr, vtcm_size, vtcm_size, vtcm_size); // single page
+    HAP_compute_res_attr_set_vtcm_param_v2(&attr, vtcm_size, min_page, vtcm_size); // largest pages available
     HAP_compute_res_attr_set_release_callback(&attr, vtcm_release_callback, (void *) ctx);
     HAP_compute_res_attr_set_hmx_param(&attr, 1);
 
     // Allocate VTCM for scratch pads
     uint32_t rctx = HAP_compute_res_acquire(&attr, 1000000 /* timeout */);
     if (!rctx) {
-        FARF(ERROR, "failed to allocate %zu bytes VTCM\n", ctx->vtcm_size);
+        FARF(ERROR, "failed to allocate %u bytes VTCM (page %u)\n", vtcm_size, min_page);
         return AEE_ENOMEMORY;
     }
 
@@ -354,6 +379,7 @@ static int vtcm_alloc(struct htp_context * ctx, uint64_t size_override) {
         return AEE_ENOMEMORY;
     }
 
+    dma_set_vtcm_range((uint32_t) (uintptr_t) vtcm_ptr, vtcm_size);
     ctx->vtcm_base          = (uint8_t *) vtcm_ptr;
     ctx->vtcm_size          = vtcm_size;
     ctx->vtcm_rctx          = rctx;
@@ -567,7 +593,7 @@ AEEResult htp_iface_start(remote_handle64 handle, uint32_t sess_id, uint64_t dsp
     ctx->max_vmem    = max_vmem;
     ctx->dsp_queue   = dsp_queue;
 
-    err = vtcm_alloc(ctx, vtcm_size);
+    err = vtcm_alloc(ctx, vtcm_size, n_hmx != 0);
     if (err != AEE_SUCCESS) {
         FARF(ERROR, "Unable to allocate VTCM");
         htp_iface_stop(handle);
@@ -575,6 +601,7 @@ AEEResult htp_iface_start(remote_handle64 handle, uint32_t sess_id, uint64_t dsp
     }
 
     HAP_setFARFRuntimeLoggingParams(0xffff, NULL, 0);
+    { extern void htp_v68_selftest(void); htp_v68_selftest(); }
 
     // Set client class
     {

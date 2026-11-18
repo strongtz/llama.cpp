@@ -97,6 +97,7 @@ function(build_htp_skel V)
     set(HTP_PROJECTS ${HTP_PROJECTS} PARENT_SCOPE)
 endfunction()
 
+build_htp_skel(v68)
 build_htp_skel(v73)
 build_htp_skel(v75)
 build_htp_skel(v79)

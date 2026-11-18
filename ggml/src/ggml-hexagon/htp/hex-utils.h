@@ -8,6 +8,7 @@
 
 #include "hexagon_types.h"
 #include "hexagon_protos.h"
+#include "hvx-v68-compat.h"
 
 #include "hex-fastdiv.h"
 #include "hex-dump.h"

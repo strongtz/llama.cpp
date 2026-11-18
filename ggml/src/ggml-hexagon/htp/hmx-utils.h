@@ -221,8 +221,13 @@ static inline void hmx_interleave_cols_to_tiles(__fp16 * restrict tiles_out,
 #define HMX_STORE_AFTER_F16(out, scale_reg) \
     "mxmem(" out ", " scale_reg "):after.hf = acc\n"
 
+#if __HVX_ARCH__ < 73
+// v68: the convert-transfer is a fixed identity pass, no bias/scale stage
+#define HMX_SET_BIAS(scales) ""
+#else
 #define HMX_SET_BIAS(scales) \
     "bias = mxmem2(" scales ")\n"
+#endif
 
 #define HMX_CLRACC_F16() \
     "mxclracc.hf\n"

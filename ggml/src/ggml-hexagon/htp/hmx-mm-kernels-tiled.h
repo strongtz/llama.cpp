@@ -1,6 +1,12 @@
 #include "hmx-utils.h"
 #include "hmx-queue.h"
 
+#if __HVX_ARCH__ < 73
+// all int16 -> fp16 conversions below operate on small quant values (|x| < 512)
+#undef Q6_Vhf_equals_Vh
+#define Q6_Vhf_equals_Vh(v) hvx_v68_hf_from_h_small(v)
+#endif
+
 // MXFP4 dequantization LUT: maps 4-bit index to fp16 mantissa value
 // kvalues: 0, 0.5, 1, 1.5, 2, 3, 4, 6, 0, -0.5, -1, -1.5, -2, -3, -4, -6
 static const __fp16 mxfp4_to_fp16_lut[64] __attribute__((aligned(VLEN))) = {

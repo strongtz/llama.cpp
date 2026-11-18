@@ -86,6 +86,8 @@ size_t opt_ndev       = 1;
 size_t opt_nhvx       = 0; // use all
 int    opt_nhmx       = 1; // when set, enable HMX; when 0, use HVX only
 size_t opt_vtcm_size  = 0; // VTCM size override in bytes; 0 = auto-detect
+
+#define HTP_V68_VTCM_PAGE_SIZE (4u * 1024 * 1024)
 size_t opt_vmem       = HTP_OP_MAX_VMEM_DEFAULT;  // max available va space for buffer mappings
 int    opt_etm        = 0;
 int    opt_verbose    = 0;
@@ -2288,6 +2290,11 @@ void ggml_hexagon_session::allocate(const ggml_hexagon_device_config & config) n
                 }
                 this->vtcm_size = opt_vtcm_size;
             }
+            if (opt_arch < 73 && this->n_hmx && this->vtcm_size > HTP_V68_VTCM_PAGE_SIZE) {
+                // v68: VTCM is split into 4MB pages and HMX operands must not cross a page,
+                // the DSP side restricts itself to a single page in this case.
+                this->vtcm_size = HTP_V68_VTCM_PAGE_SIZE;
+            }
             GGML_LOG_INFO("ggml-hex: %s hwinfo: threads %u, hvx %u, hmx %u, vtcm %llu MB\n",
                           this->c_name(), this->n_threads, this->n_hvx, this->n_hmx,
                           (unsigned long long)(this->vtcm_size / (1024 * 1024)));
@@ -3566,9 +3573,9 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
             GGML_LOG_ERROR("ggml-hex: failed to query HTP version (err %d) defaulting to v73\n", err);
             opt_arch = 73;
         } else {
-            if (opt_arch < 73) {
-                GGML_LOG_WARN("ggml-hex: Hexagon arch v%d is under supported range, capping at v73\n", opt_arch);
-                opt_arch = 73;
+            if (opt_arch < 68) {
+                GGML_LOG_WARN("ggml-hex: Hexagon arch v%d is under supported range, capping at v68\n", opt_arch);
+                opt_arch = 68;
             } else if (opt_arch > 85) {
                 GGML_LOG_WARN("ggml-hex: Hexagon arch v%d is over supported range, capping at v85\n", opt_arch);
                 opt_arch = 85;
