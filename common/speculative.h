@@ -89,6 +89,11 @@ void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, co
 // process the batch and update the internal state of the speculative context
 bool common_speculative_process(common_speculative * spec, const common_batch & batch);
 
+// MTP: the pending target hidden row of a sequence (paired with the next processed token).
+// Copies it to out and/or overwrites it with in (both optional). Returns its width (n_embd),
+// 0 if spec has no MTP implementation.
+int32_t common_speculative_mtp_pending_h(common_speculative * spec, llama_seq_id seq_id, float * out, const float * in);
+
 // generate drafts for the sequences specified with `common_speculative_get_draft_params`
 void common_speculative_draft(common_speculative * spec);
 

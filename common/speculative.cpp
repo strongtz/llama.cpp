@@ -3103,6 +3103,27 @@ void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, co
     }
 }
 
+int32_t common_speculative_mtp_pending_h(common_speculative * spec, llama_seq_id seq_id, float * out, const float * in) {
+    if (spec == nullptr) {
+        return 0;
+    }
+    for (auto & impl : spec->impls) {
+        auto * mtp = dynamic_cast<common_speculative_impl_draft_mtp *>(impl.get());
+        if (mtp == nullptr || seq_id < 0 || (size_t) seq_id >= mtp->pending_h.size()) {
+            continue;
+        }
+        auto & h = mtp->pending_h[seq_id];
+        if (out) {
+            std::memcpy(out, h.data(), h.size() * sizeof(float));
+        }
+        if (in) {
+            std::memcpy(h.data(), in, h.size() * sizeof(float));
+        }
+        return (int32_t) h.size();
+    }
+    return 0;
+}
+
 bool common_speculative_process(common_speculative * spec, const common_batch & batch) {
     bool result = true;
 

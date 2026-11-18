@@ -1104,6 +1104,12 @@ private:
 
     common_speculative_ptr spec;
 
+    // MTP head on the NPU: mirrors the GPU MTP context for the prompt tokens prefilled on the NPU
+    llama_context *    ctx_npu_mtp  = nullptr;
+    bool               npu_mtp_init = false;
+    common_batch       npu_mtp_batch;
+    std::vector<float> npu_mtp_h;   // pending h row (n_embd)
+
     bool add_bos_token = true;
 
     int32_t n_ctx; // total context for all clients / slots
@@ -1151,6 +1157,10 @@ private:
         ctx_dft   = nullptr;
         model_dft = nullptr;
 
+        if (ctx_npu_mtp) {
+            llama_free(ctx_npu_mtp);
+            ctx_npu_mtp = nullptr;
+        }
         if (ctx_npu) {
             llama_free(ctx_npu);
             ctx_npu = nullptr;
@@ -1255,6 +1265,11 @@ private:
         mparams.main_gpu     = 0;
         mparams.progress_callback = nullptr;
         mparams.progress_callback_user_data = nullptr;
+        if (const char * v = getenv("LLAMA_NPU_MTP")) {
+            if (atoi(v) == 0) {
+                mparams.load_mtp = false;   // the NPU model does not run the MTP head
+            }
+        }
 
         // Share q4_0 weights with the GPU (decode) model: tensors whose OpenCL copy lives in a
         // dma-buf in a layout the NPU understands are not loaded again, the NPU tensors are
@@ -1347,6 +1362,8 @@ private:
         // do not reserve an n_ubatch x n_vocab output
         cparams.n_outputs_max         = 1;
         cparams.n_outputs_max_per_seq = 1;
+        // no speculative rollback on the NPU context: recurrent-state snapshots only cost time
+        cparams.n_rs_seq              = 0;
         ctx_npu = llama_init_from_model(model_npu, cparams);
         if (!ctx_npu) {
             SRV_ERR("%s", "NPU prefill: failed to create context\n");
@@ -1355,6 +1372,44 @@ private:
         npu_batch = common_batch(ctx_npu);
         SRV_INF("NPU prefill: enabled on %s (n_ubatch = %d, min tokens = %d)\n", dev_name, n_ubatch, npu_min_tokens);
         return true;
+    }
+
+    // lazily create the MTP head context on the NPU model (needs the GPU spec / MTP context)
+    void npu_mtp_try_init() {
+        if (npu_mtp_init || !ctx_npu || !spec || !ctx_dft) {
+            return;
+        }
+        npu_mtp_init = true;
+        const char * env = getenv("LLAMA_NPU_MTP");
+        if (env && atoi(env) == 0) {
+            return;
+        }
+        const int32_t n_embd_h = common_speculative_mtp_pending_h(spec.get(), 0, nullptr, nullptr);
+        if (n_embd_h <= 0 || llama_model_n_layer_nextn(model_npu) <= 0) {
+            return;
+        }
+        llama_context_params cparams = common_context_params_to_llama(params_base);
+        cparams.ctx_type        = LLAMA_CONTEXT_TYPE_MTP;
+        cparams.ctx_other       = ctx_npu;
+        cparams.n_ctx           = llama_n_ctx(ctx_npu);
+        cparams.n_seq_max       = llama_n_seq_max(ctx_npu);
+        cparams.n_batch         = llama_n_batch(ctx_npu);
+        cparams.n_ubatch        = llama_n_ubatch(ctx_npu);
+        cparams.n_rs_seq        = 0;
+        cparams.embeddings      = false;
+        cparams.n_outputs_max         = 1;
+        cparams.n_outputs_max_per_seq = 1;
+        cparams.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+        ctx_npu_mtp = llama_init_from_model(model_npu, cparams);
+        if (!ctx_npu_mtp) {
+            SRV_WRN("%s", "NPU prefill: failed to create the MTP context, the MTP head misses NPU-prefilled tokens\n");
+            return;
+        }
+        llama_set_embeddings_nextn(ctx_npu, true, /*masked*/ false);
+        llama_set_embeddings_nextn(ctx_npu_mtp, true, /*masked*/ true);
+        npu_mtp_batch = common_batch(ctx_npu_mtp);
+        npu_mtp_h.assign(n_embd_h, 0.0f);
+        SRV_INF("%s", "NPU prefill: MTP head enabled on the NPU\n");
     }
 
     void copy_seq_state(llama_context * src, llama_context * dst, llama_seq_id seq) {
@@ -1399,10 +1454,18 @@ private:
         const llama_seq_id seq = slot.id;
         const int64_t t0 = ggml_time_us();
 
+        npu_mtp_try_init();
+        const bool use_mtp = ctx_npu_mtp != nullptr;
+
         int ret = 0;
         queue_tasks.yield_to_queue([&]() {
             copy_seq_state(ctx_tgt, ctx_npu, seq);
+            if (use_mtp) {
+                copy_seq_state(ctx_dft, ctx_npu_mtp, seq);
+                common_speculative_mtp_pending_h(spec.get(), seq, npu_mtp_h.data(), nullptr);
+            }
             const int64_t t1 = ggml_time_us();
+            int64_t t_mtp = 0;
 
             const int32_t nb = llama_n_batch(ctx_npu);
             for (int32_t off = i0; off < i0 + n_off && ret == 0; off += nb) {
@@ -1413,6 +1476,23 @@ private:
                     npu_batch.add(t.token, t.pos[0], seq, false);
                 }
                 ret = llama_process(ctx_npu, LLAMA_PROCESS_TYPE_DECODE, npu_batch.get());
+                if (ret == 0 && use_mtp) {
+                    // MTP catch-up: token p is paired with the target hidden row of token p - 1
+                    const int64_t tm = ggml_time_us();
+                    const float * h_tgt = llama_get_embeddings_nextn(ctx_npu);
+                    const int32_t n_embd_h = (int32_t) npu_mtp_h.size();
+                    npu_mtp_batch.clear();
+                    for (int32_t i = 0; i < n; i++) {
+                        const auto & t = batch.tokens[off + i];
+                        const int32_t idx = npu_mtp_batch.add(t.token, t.pos[0], seq, false);
+                        const float * h_row = i == 0 ? npu_mtp_h.data() : h_tgt + (size_t) (i - 1) * n_embd_h;
+                        npu_mtp_batch.set_embd_state(idx, { h_row, 1, (size_t) n_embd_h });
+                    }
+                    ret = llama_process(ctx_npu_mtp, LLAMA_PROCESS_TYPE_DECODE, npu_mtp_batch.get());
+                    llama_synchronize(ctx_npu_mtp);
+                    std::memcpy(npu_mtp_h.data(), h_tgt + (size_t) (n - 1) * n_embd_h, n_embd_h * sizeof(float));
+                    t_mtp += ggml_time_us() - tm;
+                }
             }
             if (ret != 0) {
                 return;
@@ -1421,10 +1501,14 @@ private:
             const int64_t t2 = ggml_time_us();
 
             copy_seq_state(ctx_npu, ctx_tgt, seq);
+            if (use_mtp) {
+                copy_seq_state(ctx_npu_mtp, ctx_dft, seq);
+                common_speculative_mtp_pending_h(spec.get(), seq, nullptr, npu_mtp_h.data());
+            }
             const int64_t t3 = ggml_time_us();
 
-            SLT_INF(slot, "NPU prefill: %d tokens in %.1f ms (%.1f t/s), state sync %.1f + %.1f ms\n",
-                    n_off, (t2 - t1) / 1e3, n_off / ((t2 - t1) / 1e6), (t1 - t0) / 1e3, (t3 - t2) / 1e3);
+            SLT_INF(slot, "NPU prefill: %d tokens in %.1f ms (%.1f t/s, MTP head %.1f ms), state sync %.1f + %.1f ms\n",
+                    n_off, (t2 - t1) / 1e3, n_off / ((t2 - t1) / 1e6), t_mtp / 1e3, (t1 - t0) / 1e3, (t3 - t2) / 1e3);
         });
 
         if (ret != 0) {

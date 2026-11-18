@@ -23837,8 +23837,8 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
     {
         static const int small_nq = getenv("GGML_OPENCL_FA_SMALL_NQ") ? atoi(getenv("GGML_OPENCL_FA_SMALL_NQ")) : 4;
         const int nq = (int) q->ne[1];
-        if (nq >= 2 && nq <= small_nq && q->ne[3] == 1 && dst->ne[2] == nq && dst->ne[3] == 1 &&
-            q->view_src == nullptr && dst->view_src == nullptr) {
+        // (views are fine: they share the parent extra, offsets are extra->offset + view_offs)
+        if (nq >= 2 && nq <= small_nq && q->ne[3] == 1 && dst->ne[2] == nq && dst->ne[3] == 1) {
             for (int i = 0; i < nq; ++i) {
                 ggml_tensor q_i = *q;
                 q_i.ne[1] = 1;
