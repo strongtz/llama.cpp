@@ -1,6 +1,7 @@
 #define _USE_MATH_DEFINES
 
 #include <assert.h>
+#include <sys/mman.h>
 #include <inttypes.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -412,6 +413,8 @@ struct ggml_backend_hexagon_device_context {
     ggml_backend_buffer_type buffer_type       = {};
     ggml_backend_buffer_type host_buffer_type  = {};
     ggml_backend_buffer_type fence_buffer_type = {};
+    ggml_backend_buffer_type shared_buffer_type = {};
+    std::unordered_map<int, ggml_backend_buffer_t> shared_buffers;   // dma-buf fd -> imported buffer
 
     std::unique_ptr<ggml_hexagon_session> sess;
 
@@ -445,6 +448,11 @@ struct ggml_hexagon_rpcmem_block {
 
     std::unordered_set<ggml_hexagon_session *> clones;
 
+    bool      owned = true;
+
+    // wrap memory owned by someone else (e.g. an OpenCL dma-buf), not freed here
+    ggml_hexagon_rpcmem_block(uint8_t * base, int fd, size_t size) : base(base), fd(fd), size(size), owned(false) {}
+
     ggml_hexagon_rpcmem_block(size_t size) {
         base = (uint8_t *) rpcmem_alloc2(RPCMEM_HEAP_ID_SYSTEM, RPCMEM_DEFAULT_FLAGS, size);
         if (!base) {
@@ -459,7 +467,7 @@ struct ggml_hexagon_rpcmem_block {
     }
 
     ~ggml_hexagon_rpcmem_block() {
-        if (base) {
+        if (base && owned) {
             rpcmem_free(base);
         }
     }
@@ -580,6 +588,16 @@ struct ggml_hexagon_shared_buffer {
         }
 
         alloc(total_size);
+    }
+
+    // external memory (see ggml_backend_hexagon_bind_xq4)
+    ggml_hexagon_shared_buffer(ggml_hexagon_session * sess, std::shared_ptr<ggml_hexagon_rpcmem_block> block) {
+        this->sess     = sess;
+        this->mem      = std::move(block);
+        this->mapped   = false;
+        this->pinned   = false;
+        this->extended = false;
+        this->is_weight = true;
     }
 
     // Clone constructor for cross-session mapping
@@ -1245,6 +1263,92 @@ static ggml_backend_buffer_type_i ggml_backend_hexagon_host_buffer_type_interfac
     /* .is_host             = */ ggml_backend_hexagon_host_buffer_type_is_host,
 };
 
+// ** GPU-shared weights
+//
+// The NPU model places weights that are shared with the OpenCL backend into a placeholder
+// buffer type (address space only, loads are dropped). ggml_backend_hexagon_bind_xq4() then
+// points each tensor at the OpenCL dma-buf that holds the weight in the Adreno transposed q4_0
+// layout (HTP_TENSOR_XQ4), which the HMX matmul kernels read directly.
+
+struct ggml_hexagon_placeholder_buffer {
+    void * base = nullptr;
+    size_t size = 0;
+};
+
+static void ggml_backend_hexagon_placeholder_free_buffer(ggml_backend_buffer_t buffer) {
+    auto * pb = static_cast<ggml_hexagon_placeholder_buffer *>(buffer->context);
+    if (pb->base) {
+        munmap(pb->base, pb->size);
+    }
+    delete pb;
+}
+
+static void * ggml_backend_hexagon_placeholder_get_base(ggml_backend_buffer_t buffer) {
+    return static_cast<ggml_hexagon_placeholder_buffer *>(buffer->context)->base;
+}
+
+static void ggml_backend_hexagon_placeholder_set_tensor(ggml_backend_buffer_t, ggml_tensor *, const void *, size_t, size_t) {
+}
+
+static void ggml_backend_hexagon_placeholder_get_tensor(ggml_backend_buffer_t, const ggml_tensor * t, void *, size_t, size_t) {
+    GGML_ABORT("ggml-hex: get_tensor on unbound GPU-shared weight %s", t->name);
+}
+
+static void ggml_backend_hexagon_placeholder_clear(ggml_backend_buffer_t, uint8_t) {
+}
+
+static ggml_backend_buffer_i ggml_backend_hexagon_placeholder_interface = {
+    /* .free_buffer     = */ ggml_backend_hexagon_placeholder_free_buffer,
+    /* .get_base        = */ ggml_backend_hexagon_placeholder_get_base,
+    /* .init_tensor     = */ NULL,
+    /* .memset_tensor   = */ NULL,
+    /* .set_tensor      = */ ggml_backend_hexagon_placeholder_set_tensor,
+    /* .get_tensor      = */ ggml_backend_hexagon_placeholder_get_tensor,
+    /* .set_tensor_2d   = */ NULL,
+    /* .get_tensor_2d   = */ NULL,
+    /* .cpy_tensor      = */ NULL,
+    /* .clear           = */ ggml_backend_hexagon_placeholder_clear,
+    /* .reset           = */ NULL,
+    /* .set_tensor_n    = */ NULL,
+    /* .get_tensor_n    = */ NULL,
+    /* .cpy_tensor_n    = */ NULL,
+};
+
+static ggml_backend_buffer_t ggml_backend_hexagon_placeholder_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
+    auto * pb = new ggml_hexagon_placeholder_buffer;
+    pb->size  = std::max<size_t>(size, 4096);
+    // reserve address space only (tensor data pointers must be unique and non-null)
+    pb->base = mmap(NULL, pb->size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    if (pb->base == MAP_FAILED) {
+        delete pb;
+        return nullptr;
+    }
+    return ggml_backend_buffer_init(buft, ggml_backend_hexagon_placeholder_interface, pb, size);
+}
+
+static const char * ggml_backend_hexagon_placeholder_name(ggml_backend_buffer_type_t buft) {
+    return static_cast<ggml_backend_hexagon_buffer_type_context *>(buft->context)->name.c_str();
+}
+
+static size_t ggml_backend_hexagon_placeholder_get_alignment(ggml_backend_buffer_type_t) {
+    return 128;
+}
+
+static bool ggml_backend_hexagon_placeholder_is_host(ggml_backend_buffer_type_t) {
+    return false;
+}
+
+static ggml_backend_buffer_type_i ggml_backend_hexagon_placeholder_buffer_type_interface = {
+    /* .get_name            = */ ggml_backend_hexagon_placeholder_name,
+    /* .alloc_buffer        = */ ggml_backend_hexagon_placeholder_alloc_buffer,
+    /* .alloc_buffer_n      = */ NULL,
+    /* .get_alignment       = */ ggml_backend_hexagon_placeholder_get_alignment,
+    /* .get_max_size        = */ NULL,
+    /* .get_alloc_size      = */ NULL,
+    /* .get_alloc_size_n    = */ NULL,
+    /* .is_host             = */ ggml_backend_hexagon_placeholder_is_host,
+};
+
 ggml_backend_hexagon_device_context::ggml_backend_hexagon_device_context(int dev_id, const ggml_hexagon_device_config & config, ggml_backend_dev_t dev)
     : dev_id(dev_id), config(config), dev(dev) {
     buffer_type.device  = dev;
@@ -1258,6 +1362,10 @@ ggml_backend_hexagon_device_context::ggml_backend_hexagon_device_context(int dev
     fence_buffer_type.device  = dev;
     fence_buffer_type.iface   = ggml_backend_hexagon_buffer_type_interface;
     fence_buffer_type.context = new ggml_backend_hexagon_buffer_type_context(config.name + "-FENCE", this);
+
+    shared_buffer_type.device  = dev;
+    shared_buffer_type.iface   = ggml_backend_hexagon_placeholder_buffer_type_interface;
+    shared_buffer_type.context = new ggml_backend_hexagon_buffer_type_context(config.name + "-GPUSHARED", this);
 }
 
 ggml_backend_hexagon_device_context::~ggml_backend_hexagon_device_context() {
@@ -1393,7 +1501,7 @@ struct ggml_hexagon_opbatch {
             h.size  = ggml_nbytes(t);
         }
 
-        h.flags = flags & (HTP_TENSOR_WEIGHT | HTP_TENSOR_TILED | HTP_TENSOR_FENCE);
+        h.flags = flags & (HTP_TENSOR_WEIGHT | HTP_TENSOR_TILED | HTP_TENSOR_FENCE | HTP_TENSOR_XQ4);
     }
 
     static uint64_t hash_tensor(const ggml_tensor * t, const htp_tensor & shape) {
@@ -3288,7 +3396,7 @@ static bool ggml_backend_hexagon_device_supports_op(ggml_backend_dev_t dev, cons
 static bool ggml_backend_hexagon_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
     auto dev_ctx = static_cast<ggml_backend_hexagon_device_context *>(dev->context);
 
-    bool supp = (buft == &dev_ctx->host_buffer_type) || (buft == &dev_ctx->buffer_type);
+    bool supp = (buft == &dev_ctx->host_buffer_type) || (buft == &dev_ctx->buffer_type) || (buft == &dev_ctx->shared_buffer_type);
 
     HEX_VERBOSE("ggml-hex: %s device-supports-buft %s %s\n", dev_ctx->c_name(), ggml_backend_buft_name(buft), supp ? "yes" : "no");
     return supp;
@@ -3509,8 +3617,51 @@ static ggml_backend_buffer_type_t ggml_backend_hexagon_split_buffer_type(int mai
     return &dev_ctx->buffer_type;
 }
 
+static ggml_backend_buffer_type_t ggml_backend_hexagon_shared_buffer_type(ggml_backend_dev_t dev) {
+    auto dev_ctx = static_cast<ggml_backend_hexagon_device_context *>(dev->context);
+    return &dev_ctx->shared_buffer_type;
+}
+
+// Point a q4_0 weight (placed in the shared buffer type) at memory of another device:
+//   fd/base/size : the dma-buf (mmap'ed at base in this process)
+//   d_off/q_off  : offsets of the scales [n_mat][K/32][M] (fp16) and quants [n_mat][K/8][M] (u32)
+static bool ggml_backend_hexagon_bind_xq4(ggml_backend_dev_t dev, ggml_tensor * t, int fd, void * base, size_t size,
+                                          size_t d_off, size_t q_off) {
+    auto dev_ctx = static_cast<ggml_backend_hexagon_device_context *>(dev->context);
+    if (t->type != GGML_TYPE_Q4_0 || t->ne[0] % 32 != 0 || t->ne[1] % 32 != 0 || t->ne[3] != 1) {
+        return false;
+    }
+    const size_t size_d = (size_t) ggml_nelements(t) / 32 * 2;
+    if (q_off < d_off || q_off - d_off != hex_round_up(size_d, HTP_XQ4_ALIGN) || q_off + size_d * 8 > size || (d_off & 127) != 0) {
+        GGML_LOG_WARN("ggml-hex: %s: cannot share %s (d_off %zu q_off %zu)\n", dev_ctx->c_name(), t->name, d_off, q_off);
+        return false;
+    }
+    auto sess = dev_ctx->session();
+    ggml_backend_buffer_t buf;
+    auto it = dev_ctx->shared_buffers.find(fd);
+    if (it != dev_ctx->shared_buffers.end()) {
+        buf = it->second;
+    } else {
+        auto block = std::make_shared<ggml_hexagon_rpcmem_block>((uint8_t *) base, fd, size);
+        auto * sbuf = new ggml_hexagon_shared_buffer(sess, block);
+        buf = ggml_backend_buffer_init(&dev_ctx->buffer_type, ggml_backend_hexagon_buffer_interface, sbuf, size);
+        ggml_backend_buffer_set_usage(buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+        dev_ctx->shared_buffers[fd] = buf;
+    }
+    t->buffer = buf;
+    t->data   = (uint8_t *) base + d_off;
+    t->extra  = (void *) (uintptr_t) (HTP_TENSOR_WEIGHT | HTP_TENSOR_XQ4);
+    return true;
+}
+
 static void * ggml_backend_hexagon_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
+    if (strcmp(name, "ggml_backend_hexagon_shared_buffer_type") == 0) {
+        return (void *) ggml_backend_hexagon_shared_buffer_type;
+    }
+    if (strcmp(name, "ggml_backend_hexagon_bind_xq4") == 0) {
+        return (void *) ggml_backend_hexagon_bind_xq4;
+    }
     if (strcmp(name, "ggml_backend_split_buffer_type") == 0) {
         return (void *) ggml_backend_hexagon_split_buffer_type;
     }

@@ -236,6 +236,14 @@ static void parse_tensor_buffer_overrides(const std::string & value, std::vector
         if (buft) {
             buft_list[ggml_backend_buft_name(buft)] = buft;
         }
+        // extra buffer types of non-CPU devices (e.g. OpenCL_Shared)
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+        if (reg && ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+            auto get_extra = (ggml_backend_dev_get_extra_bufts_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_dev_get_extra_bufts");
+            for (auto * e = get_extra ? get_extra(dev) : nullptr; e && *e; ++e) {
+                buft_list[ggml_backend_buft_name(*e)] = *e;
+            }
+        }
     }
 
     for (const auto & override : string_split<std::string>(value, ',')) {

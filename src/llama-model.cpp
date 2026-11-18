@@ -3987,6 +3987,26 @@ bool llama_model_is_diffusion(const llama_model * model) {
     return llm_arch_is_diffusion(model->arch);
 }
 
+int32_t llama_model_n_weight_tensors(const llama_model * model) {
+    return (int32_t) model->tensors_by_name.size();
+}
+
+ggml_tensor * llama_model_weight_tensor(const llama_model * model, int32_t i) {
+    if (i < 0 || (size_t) i >= model->tensors_by_name.size()) {
+        return nullptr;
+    }
+    return model->tensors_by_name[i].second;
+}
+
+ggml_tensor * llama_model_weight_tensor_by_name(const llama_model * model, const char * name) {
+    for (const auto & it : model->tensors_by_name) {
+        if (it.first == name) {
+            return it.second;
+        }
+    }
+    return nullptr;
+}
+
 const std::vector<std::pair<std::string, ggml_tensor *>> & llama_internal_get_tensor_map(const llama_model * model) {
     return model->tensors_by_name;
 }

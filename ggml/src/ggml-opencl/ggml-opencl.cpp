@@ -32,6 +32,14 @@ typedef const void * (*get_adreno_bin_kernel_func_t)(
 );
 
 #include <CL/cl.h>
+#include <thread>
+#if defined(__linux__)
+#include <fcntl.h>
+#include <linux/dma-heap.h>
+#include <sys/ioctl.h>
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
 
 #include <inttypes.h>
 #include <string.h>
@@ -9544,6 +9552,9 @@ struct ggml_tensor_extra_cl_q1_0 {
 // they should always be allocated from the pool. Hence, they do not have an
 // `offset`, which indicate their locations in the scratch buffer.
 struct ggml_tensor_extra_cl_q4_0 {
+    // Layout shareable with other devices: 0 = none, 1 = MoE trans4 (noshuffle), 2 = dense 32-bit
+    // transposed (bin). Both are q[K/8][M] u32 + d[K/32][M] fp16 per matrix.
+    int shared_layout = 0;
     // Quantized values.
     cl_mem q = nullptr;
     // Quantized values in image1d_buffer_t.
@@ -9562,6 +9573,7 @@ struct ggml_tensor_extra_cl_q4_0 {
     }
 
     void reset() {
+        shared_layout = 0;
         // q and d are subbuffers into the bigger buffer allocated in ggml_backend_buffer.
         // They must be properly released so that the original buffer can be
         // properly released to avoid memory leak.
@@ -12413,6 +12425,62 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
 // Forward declaration - implementation appears later in the file.
 static const char * ggml_backend_opencl_buffer_type_get_name(ggml_backend_buffer_type_t buffer_type);
 
+// "OpenCL_Shared" buffer type: dma-buf backed weights that other devices (Hexagon) read as well.
+// The imported dma-buf is only coherent for CPU writes followed by GPU reads on this driver, so
+// tensors are converted to the GPU layout on the CPU and written directly into the mapping.
+static int g_opencl_shared_buft_marker;
+static inline bool ggml_cl_buft_is_shared(ggml_backend_buffer_type_t buft) {
+    return buft && buft->context == &g_opencl_shared_buft_marker;
+}
+
+#if defined(__linux__)
+#include <linux/dma-buf.h>
+static void ggml_cl_dmabuf_sync(int fd, uint64_t flags) {
+    struct dma_buf_sync s;
+    s.flags = flags;
+    ioctl(fd, DMA_BUF_IOCTL_SYNC, &s);
+}
+#endif
+
+struct ggml_cl_blk_q4_0 { ggml_fp16_t d; uint8_t qs[16]; };
+static_assert(sizeof(ggml_cl_blk_q4_0) == 18, "q4_0 block size");
+
+// block_q4_0 rows -> d[n_mat][K/32][M] fp16 + q[n_mat][K/8][M] u32 (noshuffle nibbles)
+static void ggml_cl_q4_0_to_trans4_cpu(const ggml_cl_blk_q4_0 * src, ggml_fp16_t * dst_d, uint32_t * dst_q,
+                                       int64_t ne00, int64_t ne01, int64_t ne02) {
+    const int64_t nb = ne00 / 32;
+    const int64_t n_rows = ne01 * ne02;
+    const int n_thr = std::max(1u, std::min(8u, std::thread::hardware_concurrency()));
+    std::vector<std::thread> th;
+    for (int t = 0; t < n_thr; ++t) {
+        th.emplace_back([=]() {
+            for (int64_t r = t; r < n_rows; r += n_thr) {
+                const int64_t i02 = r / ne01, i01 = r % ne01;
+                const ggml_cl_blk_q4_0 * row = src + r * nb;
+                for (int64_t i00 = 0; i00 < nb; ++i00) {
+                    const ggml_cl_blk_q4_0 & b = row[i00];
+                    dst_d[i02 * nb * ne01 + i00 * ne01 + i01] = b.d;
+                    uint8_t post[16];
+                    for (int i = 0; i < 8; ++i) {
+                        const uint8_t x0 = b.qs[2 * i + 0], x1 = b.qs[2 * i + 1];
+                        post[i + 0] = (uint8_t) ((x0 & 0x0F) | ((x1 & 0x0F) << 4));
+                        post[i + 8] = (uint8_t) ((x0 >> 4) | (x1 & 0xF0));
+                    }
+                    uint32_t w[4];
+                    memcpy(w, post, 16);
+                    const int64_t o = i02 * nb * ne01 * 4 + i00 * ne01 * 4 + i01;
+                    for (int k = 0; k < 4; ++k) {
+                        dst_q[o + k * ne01] = w[k];
+                    }
+                }
+            }
+        });
+    }
+    for (auto & x : th) {
+        x.join();
+    }
+}
+
 static ggml_guid_t ggml_backend_opencl_guid() {
     static ggml_guid guid = { 0xde, 0xe0, 0x70, 0xa2, 0x73, 0x4e, 0x4d, 0xbc, 0xb0, 0xc7, 0x4f, 0xd4, 0x6d, 0x4e, 0x90, 0xfe };
     return &guid;
@@ -12470,7 +12538,15 @@ struct ggml_backend_opencl_buffer_context {
         buffer.push_back(buf);
     }
 
+    void release_dmabuf();
+
+    // dma-buf backing (GGML_OPENCL_DMABUF), shareable with other devices
+    int    dmabuf_fd   = -1;
+    void * dmabuf_ptr  = nullptr;
+    size_t dmabuf_size = 0;
+
     ~ggml_backend_opencl_buffer_context() {
+        release_dmabuf();
         for (cl_mem buf : buffer) {
             CL_CHECK(clReleaseMemObject(buf));
         }
@@ -13303,6 +13379,20 @@ static cl_mem ggml_cl_create_temp_download_buffer(
 }
 
 static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
+#if defined(__linux__)
+    {
+        auto * sctx = (ggml_backend_opencl_buffer_context *) buffer->context;
+        if (sctx->dmabuf_fd >= 0 && tensor->type != GGML_TYPE_Q4_0) {
+            GGML_ASSERT(!ggml_is_quantized(tensor->type) && "only q4_0 / float weights are supported in OpenCL_Shared buffers");
+            ggml_tensor_extra_cl * e = (ggml_tensor_extra_cl *) tensor->extra;
+            GGML_ASSERT(e);
+            ggml_cl_dmabuf_sync(sctx->dmabuf_fd, DMA_BUF_SYNC_START | DMA_BUF_SYNC_WRITE);
+            memcpy((uint8_t *) sctx->dmabuf_ptr + e->offset + tensor->view_offs + offset, data, size);
+            ggml_cl_dmabuf_sync(sctx->dmabuf_fd, DMA_BUF_SYNC_END | DMA_BUF_SYNC_WRITE);
+            return;
+        }
+    }
+#endif
     ggml_backend_opencl_device_context * dev_ctx = (ggml_backend_opencl_device_context *) buffer->buft->device->context;
     ggml_backend_opencl_context * backend_ctx = dev_ctx->backend_ctx;
 
@@ -14189,9 +14279,10 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
         size_t size_q = ggml_nelements(tensor)/ggml_blck_size(tensor->type)*ggml_blck_size(tensor->type)/2;
         GGML_ASSERT(size_d + size_q == ggml_nbytes(tensor) && "Incorrect tensor size");
 
+        const bool shared = ctx->dmabuf_fd >= 0;
         cl_int err;
-        cl_mem data_device = ggml_cl_create_temp_upload_buffer(context, queue, ggml_nbytes(tensor), data, tensor->name);
-        GGML_ASSERT(data_device != NULL && "set_tensor: temp upload buffer alloc failed");
+        cl_mem data_device = shared ? nullptr : ggml_cl_create_temp_upload_buffer(context, queue, ggml_nbytes(tensor), data, tensor->name);
+        GGML_ASSERT((shared || data_device != NULL) && "set_tensor: temp upload buffer alloc failed");
 
         // We consider the specified offset arg as always, although For weights
         // the offset arg should be 0 (we do not assert this).
@@ -14229,6 +14320,36 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
             CL_BUFFER_CREATE_TYPE_REGION, &region, &err);
         CL_CHECK(err);
 
+#if defined(GGML_OPENCL_USE_ADRENO_KERNELS) && defined(__linux__)
+        if (shared) {
+            GGML_ASSERT(offset == 0 && size == ggml_nbytes(tensor) && "shared q4_0 weights must be set at once");
+            GGML_ASSERT(use_adreno_moe_kernels(backend_ctx, tensor) && "only MoE q4_0 weights are supported in OpenCL_Shared buffers");
+            size_t d_off = 0, q_off = 0;
+            CL_CHECK(clGetMemObjectInfo(extra->d, CL_MEM_OFFSET, sizeof(d_off), &d_off, NULL));
+            CL_CHECK(clGetMemObjectInfo(extra->q, CL_MEM_OFFSET, sizeof(q_off), &q_off, NULL));
+            ggml_cl_dmabuf_sync(ctx->dmabuf_fd, DMA_BUF_SYNC_START | DMA_BUF_SYNC_WRITE);
+            ggml_cl_q4_0_to_trans4_cpu((const ggml_cl_blk_q4_0 *) data,
+                                       (ggml_fp16_t *) ((uint8_t *) ctx->dmabuf_ptr + d_off),
+                                       (uint32_t *) ((uint8_t *) ctx->dmabuf_ptr + q_off),
+                                       tensor->ne[0], tensor->ne[1], tensor->ne[2]);
+            ggml_cl_dmabuf_sync(ctx->dmabuf_fd, DMA_BUF_SYNC_END | DMA_BUF_SYNC_WRITE);
+
+            cl_image_format img_format_q = {CL_R, CL_UNSIGNED_INT32};
+            cl_image_desc img_desc_q = {
+                CL_MEM_OBJECT_IMAGE1D_BUFFER,
+                static_cast<size_t>(ggml_nelements(tensor) / 8),
+                0, 0, 0, 0, 0, 0, 0,
+                { extra->q }
+            };
+            extra->q_img = clCreateImage(context, CL_MEM_READ_ONLY, &img_format_q, &img_desc_q, NULL, &err);
+            CL_CHECK(err);
+            extra->shared_layout = 1;
+            tensor->extra = extra;
+            ctx->q4_0_soa_tensors.insert(tensor);
+            return;
+        }
+#endif
+
 #ifdef GGML_OPENCL_USE_ADRENO_KERNELS
         // Adreno moe q4_0 kernel needs special transpose and unshuffling
         if (use_adreno_moe_kernels(backend_ctx, tensor)) {
@@ -14260,6 +14381,7 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
                 { extra->q }
             };
             extra->q_img = clCreateImage(context, CL_MEM_READ_ONLY, &img_format_q, &img_desc_q, NULL, &err);
+            extra->shared_layout = 1;
             tensor->extra = extra;
             // MoE tensors are also SOA'ed
             ctx->q4_0_soa_tensors.insert(tensor);
@@ -14312,6 +14434,7 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
                 GGML_ASSERT(M % 64 == 0);
                 transpose_2d_as_32b(backend_ctx, extra->q, extra->q, size_q, K / 8, M);
                 transpose_2d_as_16b(backend_ctx, extra->d, extra->d, size_d, K / 32, M);
+                extra->shared_layout = 2;
 
                 wimg_fmt = { CL_R, CL_UNSIGNED_INT32 };
                 memset(&wimg_desc, 0, sizeof(wimg_desc));
@@ -17639,9 +17762,7 @@ static ggml_backend_buffer_i ggml_backend_opencl_buffer_interface = {
 //
 
 static const char * ggml_backend_opencl_buffer_type_get_name(ggml_backend_buffer_type_t buffer_type) {
-    return "OpenCL";
-
-    GGML_UNUSED(buffer_type);
+    return ggml_cl_buft_is_shared(buffer_type) ? "OpenCL_Shared" : "OpenCL";
 }
 
 static ggml_backend_buffer_t ggml_backend_opencl_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buffer_type, size_t size) {
@@ -17657,7 +17778,53 @@ static ggml_backend_buffer_t ggml_backend_opencl_buffer_type_alloc_buffer(ggml_b
     size = std::max(size, (size_t)1);
 
     cl_int err;
-    cl_mem mem = clCreateBuffer(backend_ctx->context, CL_MEM_READ_WRITE, size, NULL, &err);
+    cl_mem mem = nullptr;
+    int    dmabuf_fd = -1;
+    void * dmabuf_ptr = nullptr;
+    size_t dmabuf_size = 0;
+#if defined(__linux__)
+    // experimental: back the buffer with a dma-buf (system heap) imported through
+    // cl_qcom_dmabuf_host_ptr, so that other devices (Hexagon) can map the same memory
+    const bool use_dmabuf = ggml_cl_buft_is_shared(buffer_type);
+    if (use_dmabuf) {
+        static int heap_fd = open("/dev/dma_heap/system", O_RDWR | O_CLOEXEC);
+        struct dma_heap_allocation_data a;
+        memset(&a, 0, sizeof(a));
+        a.len      = (size + 4095) & ~(size_t) 4095;
+        a.fd_flags = O_RDWR | O_CLOEXEC;
+        if (heap_fd >= 0 && ioctl(heap_fd, DMA_HEAP_IOCTL_ALLOC, &a) == 0) {
+            void * p = mmap(NULL, a.len, PROT_READ | PROT_WRITE, MAP_SHARED, a.fd, 0);
+            if (p != MAP_FAILED) {
+                struct {
+                    cl_uint allocation_type;
+                    cl_uint host_cache_policy;
+                    int     dmabuf_filedesc;
+                    void *  dmabuf_hostptr;
+                } dh = { 0x411D /* CL_MEM_DMABUF_HOST_PTR_QCOM */, 0x40A5 /* CL_MEM_HOST_WRITEBACK_QCOM */, (int) a.fd, p };
+                mem = clCreateBuffer(backend_ctx->context, CL_MEM_READ_WRITE | CL_MEM_USE_HOST_PTR | (1 << 29) /* CL_MEM_EXT_HOST_PTR_QCOM */,
+                                     size, &dh, &err);
+                if (err != CL_SUCCESS) {
+                    GGML_LOG_WARN("%s: dma-buf import of %zu bytes failed (%d)\n", __func__, size, err);
+                    mem = nullptr;
+                    munmap(p, a.len);
+                    close((int) a.fd);
+                } else {
+                    dmabuf_fd   = (int) a.fd;
+                    dmabuf_ptr  = p;
+                    dmabuf_size = a.len;
+                }
+            } else {
+                close((int) a.fd);
+            }
+        }
+    }
+    if (use_dmabuf && !mem) {
+        GGML_LOG_ERROR("%s: failed to allocate a shared (dma-buf) buffer of %zu bytes\n", __func__, size);
+        return nullptr;
+    }
+    if (!mem)
+#endif
+    mem = clCreateBuffer(backend_ctx->context, CL_MEM_READ_WRITE, size, NULL, &err);
     // On Adreno X1-85 the device pool intermittently fails at hundreds of MB
     // once the heap fragments (e.g. graph-allocator compute-buffer reserve
     // after model load). Four-step retry:
@@ -17701,6 +17868,9 @@ static ggml_backend_buffer_t ggml_backend_opencl_buffer_type_alloc_buffer(ggml_b
     }
 
     ggml_backend_opencl_buffer_context * ctx = new ggml_backend_opencl_buffer_context(mem);
+    ctx->dmabuf_fd   = dmabuf_fd;
+    ctx->dmabuf_ptr  = dmabuf_ptr;
+    ctx->dmabuf_size = dmabuf_size;
 
     return ggml_backend_buffer_init(buffer_type, ggml_backend_opencl_buffer_interface, ctx, size);
 }
@@ -17715,6 +17885,11 @@ static size_t ggml_backend_opencl_buffer_type_get_max_size(ggml_backend_buffer_t
     if (max_size == (size_t)-1) {
         ggml_backend_opencl_device_context * dev_ctx = (ggml_backend_opencl_device_context *) buffer_type->device->context;
         max_size = dev_ctx->backend_ctx->max_alloc_size;
+    }
+    if (ggml_cl_buft_is_shared(buffer_type)) {
+        // small dma-bufs: Hexagon maps them on demand within a 32-bit IOVA window
+        const char * mb = getenv("GGML_OPENCL_SHARED_MAX_MB");
+        return std::min(max_size, (size_t) (mb ? atoi(mb) : 192) << 20);
     }
     return max_size;
 }
@@ -17902,11 +18077,93 @@ static ggml_backend_dev_t ggml_backend_opencl_reg_device_get(ggml_backend_reg_t 
     GGML_UNUSED(index);
 }
 
+void ggml_backend_opencl_buffer_context::release_dmabuf() {
+#if defined(__linux__)
+    if (dmabuf_ptr) {
+        munmap(dmabuf_ptr, dmabuf_size);
+        dmabuf_ptr = nullptr;
+    }
+    if (dmabuf_fd >= 0) {
+        close(dmabuf_fd);
+        dmabuf_fd = -1;
+    }
+#endif
+}
+
+// Describe a q4_0 weight that lives in a dma-buf in a layout other devices can read:
+// scales d[n_mat][K/32][M] (fp16) at d_off, quants q[n_mat][K/8][M] (u32, 8 nibbles of a row,
+// k in natural order, low nibble first) at q_off. Returns false if the tensor is not shareable.
+struct ggml_opencl_shared_q4_0 {
+    int    fd;
+    void * base;
+    size_t size;
+    size_t d_off;
+    size_t q_off;
+    int    layout;
+};
+
+static bool ggml_backend_opencl_get_shared_q4_0(const ggml_tensor * tensor, ggml_opencl_shared_q4_0 * out) {
+    if (!tensor || tensor->type != GGML_TYPE_Q4_0 || !tensor->buffer || tensor->view_src ||
+        tensor->buffer->iface.free_buffer != ggml_backend_opencl_buffer_interface.free_buffer) {
+        return false;
+    }
+    auto * ctx = (ggml_backend_opencl_buffer_context *) tensor->buffer->context;
+    if (ctx->dmabuf_fd < 0 || !ggml_cl_is_q4_0_soa(tensor)) {
+        return false;
+    }
+    auto * extra = (ggml_tensor_extra_cl_q4_0 *) tensor->extra;
+    if (!extra || extra->shared_layout == 0 || !extra->q || !extra->d) {
+        return false;
+    }
+    size_t d_off = 0, q_off = 0;
+    cl_mem d_parent = nullptr, q_parent = nullptr;
+    if (clGetMemObjectInfo(extra->d, CL_MEM_OFFSET, sizeof(d_off), &d_off, NULL) != CL_SUCCESS ||
+        clGetMemObjectInfo(extra->q, CL_MEM_OFFSET, sizeof(q_off), &q_off, NULL) != CL_SUCCESS ||
+        clGetMemObjectInfo(extra->d, CL_MEM_ASSOCIATED_MEMOBJECT, sizeof(d_parent), &d_parent, NULL) != CL_SUCCESS ||
+        clGetMemObjectInfo(extra->q, CL_MEM_ASSOCIATED_MEMOBJECT, sizeof(q_parent), &q_parent, NULL) != CL_SUCCESS) {
+        return false;
+    }
+    if (ctx->buffer.empty() || d_parent != ctx->buffer[0] || q_parent != ctx->buffer[0]) {
+        return false;
+    }
+    out->fd     = ctx->dmabuf_fd;
+    out->base   = ctx->dmabuf_ptr;
+    out->size   = ctx->dmabuf_size;
+    out->d_off  = d_off;
+    out->q_off  = q_off;
+    out->layout = extra->shared_layout;
+    return true;
+}
+
+static ggml_backend_buffer_type_t * ggml_backend_opencl_dev_get_extra_bufts(ggml_backend_dev_t dev) {
+    static std::map<ggml_backend_dev_t, std::pair<ggml_backend_buffer_type, ggml_backend_buffer_type_t[2]>> bufts;
+    auto & e = bufts[dev];
+    e.first = ggml_backend_buffer_type{
+        /* .iface   = */ ggml_backend_opencl_buffer_type_interface,
+        /* .device  = */ dev,
+        /* .context = */ &g_opencl_shared_buft_marker,
+    };
+    e.second[0] = &e.first;
+    e.second[1] = nullptr;
+    return e.second;
+}
+
+static void * ggml_backend_opencl_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
+    GGML_UNUSED(reg);
+    if (strcmp(name, "ggml_backend_dev_get_extra_bufts") == 0) {
+        return (void *) ggml_backend_opencl_dev_get_extra_bufts;
+    }
+    if (strcmp(name, "ggml_backend_opencl_get_shared_q4_0") == 0) {
+        return (void *) ggml_backend_opencl_get_shared_q4_0;
+    }
+    return NULL;
+}
+
 static struct ggml_backend_reg_i ggml_backend_opencl_reg_i = {
     /* .get_name         = */ ggml_backend_opencl_reg_get_name,
     /* .device_count     = */ ggml_backend_opencl_reg_device_count,
     /* .device_get       = */ ggml_backend_opencl_reg_device_get,
-    /* .get_proc_address = */ NULL,
+    /* .get_proc_address = */ ggml_backend_opencl_reg_get_proc_address,
 };
 
 ggml_backend_reg_t ggml_backend_opencl_reg(void) {

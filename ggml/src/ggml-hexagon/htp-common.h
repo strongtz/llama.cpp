@@ -61,8 +61,12 @@ static inline bool ggml_hexagon_tensor_is_tiled(const struct ggml_tensor * t) {
     return (ggml_hexagon_tensor_get_flags(t) & HTP_TENSOR_TILED) != 0;
 }
 
+static inline bool ggml_hexagon_tensor_is_xq4(const struct ggml_tensor * t) {
+    return (ggml_hexagon_tensor_get_flags(t) & HTP_TENSOR_XQ4) != 0;
+}
+
 static inline bool ggml_hexagon_tensor_can_tile(const struct ggml_tensor * t) {
-    if (opt_rt_repack == 0) {
+    if (opt_rt_repack == 0 || ggml_hexagon_tensor_is_xq4(t)) {
         return false;
     }
     if (t->buffer) {
@@ -74,8 +78,9 @@ static inline bool ggml_hexagon_tensor_can_tile(const struct ggml_tensor * t) {
     return htp_is_tiled_weight_tensor(t);
 }
 
+// XQ4 (GPU-shared q4_0) weights are consumed by the HMX kernels like tiled weights
 static inline bool ggml_hexagon_tensor_will_tile(const struct ggml_tensor * t) {
-    return ggml_hexagon_tensor_is_tiled(t) || ggml_hexagon_tensor_can_tile(t);
+    return ggml_hexagon_tensor_is_tiled(t) || ggml_hexagon_tensor_is_xq4(t) || ggml_hexagon_tensor_can_tile(t);
 }
 
 static inline bool htp_tensors_overlap(const struct ggml_tensor * a, const struct ggml_tensor * b) {

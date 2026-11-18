@@ -38,6 +38,7 @@ enum htp_data_type {
     HTP_TYPE_NVFP4  = 40,
     HTP_TYPE_Q1_0   = 41,
     HTP_TYPE_Q2_0   = 42,
+    HTP_TYPE_XQ4_0  = 43, // q4_0 in the OpenCL (Adreno) transposed layout, shared with the GPU
 
     HTP_TYPE_INVALID
 };
@@ -151,6 +152,10 @@ enum htp_op_code {
 
 #define HTP_MMAP_MAX_VMEM  (2147483648u)
 
+// XQ4 layout (per matrix of M rows x K): d[K/32][M] fp16, then at align_up(size_d_total, HTP_XQ4_ALIGN)
+// q[K/8][M] uint32 (8 nibbles of one row, k in natural order, low nibble first)
+#define HTP_XQ4_ALIGN 128
+
 #define HTP_DDR_SPAD_SIZE  (512 * 1024)
 
 enum htp_tensor_flags {
@@ -158,6 +163,7 @@ enum htp_tensor_flags {
     HTP_TENSOR_TILED    = (1U << 1), // Tensor is in tiled format
     HTP_TENSOR_FENCE    = (1U << 2), // Tensor is synchronization fence (explicitly managed)
     HTP_TENSOR_FUSEABLE = (1U << 3), // Tensor can be fused (host-only)
+    HTP_TENSOR_XQ4      = (1U << 4), // q4_0 weight in the OpenCL transposed layout (see HTP_TYPE_XQ4_0)
 };
 
 enum htp_buf_flags {

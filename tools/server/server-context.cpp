@@ -1256,11 +1256,81 @@ private:
         mparams.progress_callback = nullptr;
         mparams.progress_callback_user_data = nullptr;
 
+        // Share q4_0 weights with the GPU (decode) model: tensors whose OpenCL copy lives in a
+        // dma-buf in a layout the NPU understands are not loaded again, the NPU tensors are
+        // bound to the GPU memory after load.
+        struct shared_q4_0 { int fd; void * base; size_t size; size_t d_off; size_t q_off; int layout; };
+        typedef bool (*get_shared_fn_t)(const ggml_tensor *, shared_q4_0 *);
+        typedef ggml_backend_buffer_type_t (*shared_buft_fn_t)(ggml_backend_dev_t);
+        typedef bool (*bind_fn_t)(ggml_backend_dev_t, ggml_tensor *, int, void *, size_t, size_t, size_t);
+        std::vector<std::pair<std::string, shared_q4_0>> shared;
+        std::vector<std::string> patterns;
+        std::vector<llama_model_tensor_buft_override> overrides;
+        bind_fn_t bind_fn = nullptr;
+        const char * share_env = getenv("LLAMA_NPU_SHARE_WEIGHTS");
+        if (share_env && atoi(share_env) != 0) {
+            ggml_backend_reg_t ocl_reg = ggml_backend_reg_by_name("OpenCL");
+            ggml_backend_reg_t npu_reg = ggml_backend_dev_backend_reg(dev);
+            auto get_shared = ocl_reg ? (get_shared_fn_t) ggml_backend_reg_get_proc_address(ocl_reg, "ggml_backend_opencl_get_shared_q4_0") : nullptr;
+            auto shared_buft = (shared_buft_fn_t) ggml_backend_reg_get_proc_address(npu_reg, "ggml_backend_hexagon_shared_buffer_type");
+            bind_fn = (bind_fn_t) ggml_backend_reg_get_proc_address(npu_reg, "ggml_backend_hexagon_bind_xq4");
+            if (get_shared && shared_buft && bind_fn) {
+                size_t n_bytes = 0;
+                const int32_t n_t = llama_model_n_weight_tensors(model_tgt);
+                for (int32_t i = 0; i < n_t; ++i) {
+                    const ggml_tensor * t = llama_model_weight_tensor(model_tgt, i);
+                    shared_q4_0 info;
+                    // the token embedding stays on the CPU in the NPU model
+                    if (!t || strstr(t->name, "token_embd") || !get_shared(t, &info)) {
+                        continue;
+                    }
+                    const size_t size_d = (size_t) ggml_nelements(t) / 32 * 2;
+                    if (info.q_off - info.d_off != GGML_PAD(size_d, 128) || t->ne[1] % 32 != 0) {
+                        continue;
+                    }
+                    shared.emplace_back(t->name, info);
+                    n_bytes += ggml_nbytes(t);
+                }
+                for (const auto & it : shared) {
+                    std::string pat = "^";
+                    for (char c : it.first) {
+                        if (strchr(".^$|()[]{}*+?\\", c)) pat += '\\';
+                        pat += c;
+                    }
+                    pat += "$";
+                    patterns.push_back(pat);
+                }
+                ggml_backend_buffer_type_t buft = shared_buft(dev);
+                for (const auto & pat : patterns) {
+                    overrides.push_back({ pat.c_str(), buft });
+                }
+                if (mparams.tensor_buft_overrides) {
+                    for (auto * o = mparams.tensor_buft_overrides; o->pattern; ++o) {
+                        overrides.push_back(*o);
+                    }
+                }
+                overrides.push_back({ nullptr, nullptr });
+                mparams.tensor_buft_overrides = overrides.data();
+                SRV_INF("NPU prefill: sharing %zu weight tensors (%.1f MiB) with the GPU model\n", shared.size(), n_bytes / 1048576.0);
+            } else {
+                SRV_WRN("%s", "NPU prefill: weight sharing requested but not available\n");
+            }
+        }
+
         SRV_INF("NPU prefill: loading %s on %s\n", path.c_str(), dev_name);
         model_npu = llama_model_load_from_file(path.c_str(), mparams);
         if (!model_npu) {
             SRV_ERR("NPU prefill: failed to load model %s\n", path.c_str());
             return false;
+        }
+
+        for (const auto & it : shared) {
+            ggml_tensor * t = llama_model_weight_tensor_by_name(model_npu, it.first.c_str());
+            const auto & info = it.second;
+            if (!t || !bind_fn(dev, t, info.fd, info.base, info.size, info.d_off, info.q_off)) {
+                SRV_ERR("NPU prefill: failed to bind shared weight %s\n", it.first.c_str());
+                return false;
+            }
         }
 
         llama_context_params cparams = common_context_params_to_llama(params_base);

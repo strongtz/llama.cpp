@@ -555,6 +555,11 @@ extern "C" {
     LLAMA_API size_t llama_max_parallel_sequences(void);
     LLAMA_API size_t llama_max_tensor_buft_overrides(void);
 
+    // weight tensors of a loaded model (by index / by name)
+    LLAMA_API int32_t              llama_model_n_weight_tensors(const struct llama_model * model);
+    LLAMA_API struct ggml_tensor * llama_model_weight_tensor(const struct llama_model * model, int32_t i);
+    LLAMA_API struct ggml_tensor * llama_model_weight_tensor_by_name(const struct llama_model * model, const char * name);
+
     LLAMA_API bool llama_supports_mmap       (void);
     LLAMA_API bool llama_supports_mlock      (void);
     LLAMA_API bool llama_supports_gpu_offload(void);

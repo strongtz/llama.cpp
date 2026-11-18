@@ -148,7 +148,8 @@ static inline struct htp_tensor_mdev_range htp_tensor_mdev_partition(uint32_t to
 
 static inline uint32_t htp_tensor_get_tile_size(int type) {
     switch (type) {
-        case HTP_TYPE_Q4_0:   return HTP_TENSOR_TILE_SIZE_Q4_0;
+        case HTP_TYPE_Q4_0:
+        case HTP_TYPE_XQ4_0:  return HTP_TENSOR_TILE_SIZE_Q4_0;
         case HTP_TYPE_IQ4_NL: return HTP_TENSOR_TILE_SIZE_IQ4_NL;
         case HTP_TYPE_Q4_1:   return HTP_TENSOR_TILE_SIZE_Q4_1;
         case HTP_TYPE_Q5_0:   return HTP_TENSOR_TILE_SIZE_Q5_0;
@@ -183,6 +184,15 @@ static inline uint32_t htp_tensor_get_tile_padded_size(int type) {
     return (htp_tensor_get_tile_size(type) + scratch + 127u) & ~127u;
 }
 
+static inline bool htp_tensor_is_xq4(const struct htp_tensor * t) {
+    return t && (t->flags & HTP_TENSOR_XQ4) != 0;
+}
+
+// weight type as seen by the HMX matmul kernels
+static inline int htp_tensor_mm_wtype(const struct htp_tensor * t) {
+    return htp_tensor_is_xq4(t) ? HTP_TYPE_XQ4_0 : (int) t->type;
+}
+
 static inline bool htp_tensor_is_tiled(const struct htp_tensor * t) {
     return t && (t->flags & HTP_TENSOR_TILED) != 0;
 }
@@ -194,6 +204,7 @@ static inline uint32_t htp_tensor_get_row_size(int type, uint32_t ne00) {
         case HTP_TYPE_BF16:   return ne00 * 2;
         case HTP_TYPE_Q8_0:   return (ne00 / 32) * 34;
         case HTP_TYPE_Q4_0:
+        case HTP_TYPE_XQ4_0:
         case HTP_TYPE_IQ4_NL: return (ne00 / 32) * 18;
         case HTP_TYPE_Q4_1:   return (ne00 / 32) * 20;
         case HTP_TYPE_Q5_0:   return (ne00 / 32) * 22;

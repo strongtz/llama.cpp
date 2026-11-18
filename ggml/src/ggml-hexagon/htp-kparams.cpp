@@ -655,7 +655,10 @@ static bool htp_matmul_is_hmx_eligible(
     }
 
     const int m = is_matmul_id ? ne12 : ne11;
-    if (m <= HTP_MM_HMX_MIN_NROWS) {
+    if (m <= HTP_MM_HMX_MIN_NROWS && !ggml_hexagon_tensor_is_xq4(src0)) {
+        return false;
+    }
+    if (ggml_hexagon_tensor_is_xq4(src0) && (ne01 % 32 != 0 || src0->ne[3] != 1 || (!is_matmul_id && src0->ne[2] != 1))) {
         return false;
     }
 
@@ -919,6 +922,12 @@ static bool htp_kparams_solve_matmul_impl(
         }
     }
 
+    if (ggml_hexagon_tensor_is_xq4(src0)) {
+        // GPU-shared weights are only readable by the HMX kernels
+        kparams->kernel_type = HTP_MM_KERNEL_UNSUPPORTED;
+        goto finalize;
+    }
+
     htp_kparams_solve_hvx_mm(sess, src0, src1, dst, wtype, is_tiled, ne02, ne03, ne10, ne11, ne12, ne13, is_matmul_id, src2_row_size, vtcm_budget, kparams);
 
 finalize:
@@ -1142,7 +1151,7 @@ bool htp_kparams_solve_mmnx(
         }
     }
 
-    if (!is_tiled || act->type != GGML_TYPE_F32 || ne10 % 32 != 0) {
+    if (!is_tiled || ggml_hexagon_tensor_is_xq4(src0) || act->type != GGML_TYPE_F32 || ne10 % 32 != 0) {
         kparams->kernel_type = HTP_MM_KERNEL_UNSUPPORTED;
         return false;
     }
