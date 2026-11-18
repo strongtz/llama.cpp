@@ -272,6 +272,8 @@ static bool fuse_mul_mat_nx(const ggml_hexagon_session * sess, htp_opnode & prev
     auto * orig_kparams = prev.kparams<htp_mm_kernel_params>();
     const auto * cur_kparams = cur.kparams<htp_mm_kernel_params>();
 
+    const uint32_t xq_mask = HTP_TENSOR_XQ4 | HTP_TENSOR_XQ4D;
+    if ((ggml_hexagon_tensor_get_flags(w_in) & xq_mask) != (ggml_hexagon_tensor_get_flags(w0) & xq_mask)) return false;
     if (x_in != x_orig || w_in->type != w0->type || w_in->ne[0] != w0->ne[0] ||
         w0->ne[2] != 1 || w0->ne[3] != 1 || w_in->ne[2] != 1 || w_in->ne[3] != 1 ||
         ggml_hexagon_tensor_is_tiled(w_in) != ggml_hexagon_tensor_is_tiled(w0) ||
@@ -318,6 +320,8 @@ static bool fuse_mul_mat_id_nx(const ggml_hexagon_session * sess, htp_opnode & p
     const auto * cur_kparams = cur.kparams<htp_mm_kernel_params>();
 
     if (orig_kparams->unused) return false;   // biases already fused
+    if ((ggml_hexagon_tensor_get_flags(w_in) & (HTP_TENSOR_XQ4 | HTP_TENSOR_XQ4D)) !=
+        (ggml_hexagon_tensor_get_flags(w0) & (HTP_TENSOR_XQ4 | HTP_TENSOR_XQ4D))) return false;
     if (x_in != x || ids_in != ids || w_in->type != w0->type ||
         w_in->ne[0] != w0->ne[0] || w_in->ne[2] != w0->ne[2] ||
         ggml_hexagon_tensor_is_tiled(w_in) != ggml_hexagon_tensor_is_tiled(w0) ||

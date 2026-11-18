@@ -731,8 +731,20 @@ static bool htp_kparams_solve_hmx_mm(
             m_id_rows = hex_round_up(std::max(m_per_expert, 32), 32);
         }
         const uint32_t cost_m = is_matmul_id ? (uint32_t) m_id_rows : (uint32_t) m_for_solver;
-        if (!htp_mm_hmx_solve_2d_params(wtype, ne00_padded, m_id_rows, ne01_padded, m_for_solver_padded, cost_m, n_hvx, pipeline, is_matmul_id, aligned_tile_size, src2_size, vtcm_budget, &m_chunk, &n_chunk, &act_hvx_selected, &vtcm_size)) {
+        const int wtype_solve = (ggml_hexagon_tensor_get_flags(src0) & HTP_TENSOR_XQ4D) ? HTP_TYPE_XQ4D_0 : wtype;
+        if (!htp_mm_hmx_solve_2d_params(wtype_solve, ne00_padded, m_id_rows, ne01_padded, m_for_solver_padded, cost_m, n_hvx, pipeline, is_matmul_id, aligned_tile_size, src2_size, vtcm_budget, &m_chunk, &n_chunk, &act_hvx_selected, &vtcm_size)) {
             return false;
+        }
+    }
+
+    // GPU-shared dense weights (XQ4D) dequantize fastest in pairs of column tiles
+    if (ggml_hexagon_tensor_get_flags(src0) & HTP_TENSOR_XQ4D) {
+        const uint32_t n_max = htp_mm_xq4d_max_n_chunk((uint32_t) ne00_padded, 4u * 1024 * 1024 /* aux VTCM page (v68) */);
+        if (n_chunk > n_max) {
+            n_chunk = n_max;
+        }
+        if (n_chunk >= 64) {
+            n_chunk &= ~63;
         }
     }
 

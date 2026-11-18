@@ -39,6 +39,7 @@ enum htp_data_type {
     HTP_TYPE_Q1_0   = 41,
     HTP_TYPE_Q2_0   = 42,
     HTP_TYPE_XQ4_0  = 43, // q4_0 in the OpenCL (Adreno) transposed layout, shared with the GPU
+    HTP_TYPE_XQ4D_0 = 44, // q4_0 in the OpenCL dense 16-bit transposed layout: q[K/4][M] u16
 
     HTP_TYPE_INVALID
 };
@@ -164,6 +165,7 @@ enum htp_tensor_flags {
     HTP_TENSOR_FENCE    = (1U << 2), // Tensor is synchronization fence (explicitly managed)
     HTP_TENSOR_FUSEABLE = (1U << 3), // Tensor can be fused (host-only)
     HTP_TENSOR_XQ4      = (1U << 4), // q4_0 weight in the OpenCL transposed layout (see HTP_TYPE_XQ4_0)
+    HTP_TENSOR_XQ4D     = (1U << 5), // q4_0 weight in the OpenCL dense 16-bit layout (see HTP_TYPE_XQ4D_0)
 };
 
 enum htp_buf_flags {

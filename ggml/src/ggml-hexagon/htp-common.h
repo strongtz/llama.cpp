@@ -62,7 +62,7 @@ static inline bool ggml_hexagon_tensor_is_tiled(const struct ggml_tensor * t) {
 }
 
 static inline bool ggml_hexagon_tensor_is_xq4(const struct ggml_tensor * t) {
-    return (ggml_hexagon_tensor_get_flags(t) & HTP_TENSOR_XQ4) != 0;
+    return (ggml_hexagon_tensor_get_flags(t) & (HTP_TENSOR_XQ4 | HTP_TENSOR_XQ4D)) != 0;
 }
 
 static inline bool ggml_hexagon_tensor_can_tile(const struct ggml_tensor * t) {

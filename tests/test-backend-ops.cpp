@@ -13502,6 +13502,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, 8192, nt, 4096, {1, 1}, {1, 1}));
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, 32, nt, 4096, {1, 1}, {1, 1}));
     }
+    // large prefill shapes (Qwen3.5-9B), opt-in
+    if (getenv("TBO_LARGE_MM")) {
+        for (auto mk : std::vector<std::pair<int,int>>{{4096, 4096}, {12288, 4096}, {4096, 12288}, {8192, 4096}}) {
+            for (int n : {512, 365, 33}) {
+                test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, mk.first, n, mk.second, {1, 1}, {1, 1}));
+            }
+        }
+    }
     return test_cases;
 }
 #ifdef _MSC_VER
@@ -14146,6 +14154,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     }
 
 
+    // Qwen3.5-9B prefill shapes (NPU, XQ4D experiments)
+    for (auto mk : std::vector<std::pair<int,int>>{{4096, 4096}, {12288, 4096}, {4096, 12288}, {8192, 4096}}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, mk.first, 512, mk.second, {1, 1}, {1, 1}));
+    }
     return test_cases;
 }
 

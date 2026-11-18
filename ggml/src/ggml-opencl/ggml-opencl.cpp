@@ -9590,7 +9590,9 @@ struct ggml_tensor_extra_cl_q1_0 {
 // `offset`, which indicate their locations in the scratch buffer.
 struct ggml_tensor_extra_cl_q4_0 {
     // Layout shareable with other devices: 0 = none, 1 = MoE trans4 (noshuffle), 2 = dense 32-bit
-    // transposed (bin). Both are q[K/8][M] u32 + d[K/32][M] fp16 per matrix.
+    // transposed (bin): q[K/8][M] u32 + d[K/32][M] fp16 per matrix.
+    // 3 = dense 16-bit transposed (noshuffle): q[K/4][M] u16 + d[K/32][M] fp16.
+    // q words hold consecutive k (4 or 8 nibbles, low nibble first).
     int shared_layout = 0;
     // Quantized values.
     cl_mem q = nullptr;
@@ -12482,6 +12484,39 @@ static void ggml_cl_dmabuf_sync(int fd, uint64_t flags) {
 struct ggml_cl_blk_q4_0 { ggml_fp16_t d; uint8_t qs[16]; };
 static_assert(sizeof(ggml_cl_blk_q4_0) == 18, "q4_0 block size");
 
+// block_q4_0 rows -> d[K/32][M] fp16 + q[K/4][M] u16 (noshuffle nibbles, 4 consecutive k per u16)
+static void ggml_cl_q4_0_to_trans16_cpu(const ggml_cl_blk_q4_0 * src, ggml_fp16_t * dst_d, uint16_t * dst_q,
+                                        int64_t ne00, int64_t ne01) {
+    const int64_t nb = ne00 / 32;
+    const int n_thr = std::max(1u, std::min(8u, std::thread::hardware_concurrency()));
+    std::vector<std::thread> th;
+    for (int t = 0; t < n_thr; ++t) {
+        th.emplace_back([=]() {
+            for (int64_t r = t; r < ne01; r += n_thr) {
+                const ggml_cl_blk_q4_0 * row = src + r * nb;
+                for (int64_t i00 = 0; i00 < nb; ++i00) {
+                    const ggml_cl_blk_q4_0 & b = row[i00];
+                    dst_d[i00 * ne01 + r] = b.d;
+                    uint8_t post[16];
+                    for (int i = 0; i < 8; ++i) {
+                        const uint8_t x0 = b.qs[2 * i + 0], x1 = b.qs[2 * i + 1];
+                        post[i + 0] = (uint8_t) ((x0 & 0x0F) | ((x1 & 0x0F) << 4));
+                        post[i + 8] = (uint8_t) ((x0 >> 4) | (x1 & 0xF0));
+                    }
+                    uint16_t w[8];
+                    memcpy(w, post, 16);
+                    for (int k = 0; k < 8; ++k) {
+                        dst_q[(i00 * 8 + k) * ne01 + r] = w[k];
+                    }
+                }
+            }
+        });
+    }
+    for (auto & x : th) {
+        x.join();
+    }
+}
+
 // block_q4_0 rows -> d[n_mat][K/32][M] fp16 + q[n_mat][K/8][M] u32 (noshuffle nibbles)
 static void ggml_cl_q4_0_to_trans4_cpu(const ggml_cl_blk_q4_0 * src, ggml_fp16_t * dst_d, uint32_t * dst_q,
                                        int64_t ne00, int64_t ne01, int64_t ne02) {
@@ -14360,16 +14395,31 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
 #if defined(GGML_OPENCL_USE_ADRENO_KERNELS) && defined(__linux__)
         if (shared) {
             GGML_ASSERT(offset == 0 && size == ggml_nbytes(tensor) && "shared q4_0 weights must be set at once");
-            GGML_ASSERT(use_adreno_moe_kernels(backend_ctx, tensor) && "only MoE q4_0 weights are supported in OpenCL_Shared buffers");
+            const bool moe   = use_adreno_moe_kernels(backend_ctx, tensor);
+            const bool dense = !moe && use_adreno_kernels(backend_ctx, tensor) && !use_q4_0_bin_kernels(backend_ctx, tensor);
+            GGML_ASSERT((moe || dense) && "only Adreno MoE / dense (non-bin) q4_0 weights are supported in OpenCL_Shared buffers");
             size_t d_off = 0, q_off = 0;
             CL_CHECK(clGetMemObjectInfo(extra->d, CL_MEM_OFFSET, sizeof(d_off), &d_off, NULL));
             CL_CHECK(clGetMemObjectInfo(extra->q, CL_MEM_OFFSET, sizeof(q_off), &q_off, NULL));
             ggml_cl_dmabuf_sync(ctx->dmabuf_fd, DMA_BUF_SYNC_START | DMA_BUF_SYNC_WRITE);
-            ggml_cl_q4_0_to_trans4_cpu((const ggml_cl_blk_q4_0 *) data,
-                                       (ggml_fp16_t *) ((uint8_t *) ctx->dmabuf_ptr + d_off),
-                                       (uint32_t *) ((uint8_t *) ctx->dmabuf_ptr + q_off),
-                                       tensor->ne[0], tensor->ne[1], tensor->ne[2]);
+            if (dense) {
+                ggml_cl_q4_0_to_trans16_cpu((const ggml_cl_blk_q4_0 *) data,
+                                            (ggml_fp16_t *) ((uint8_t *) ctx->dmabuf_ptr + d_off),
+                                            (uint16_t *) ((uint8_t *) ctx->dmabuf_ptr + q_off),
+                                            tensor->ne[0], tensor->ne[1]);
+            } else {
+                ggml_cl_q4_0_to_trans4_cpu((const ggml_cl_blk_q4_0 *) data,
+                                           (ggml_fp16_t *) ((uint8_t *) ctx->dmabuf_ptr + d_off),
+                                           (uint32_t *) ((uint8_t *) ctx->dmabuf_ptr + q_off),
+                                           tensor->ne[0], tensor->ne[1], tensor->ne[2]);
+            }
             ggml_cl_dmabuf_sync(ctx->dmabuf_fd, DMA_BUF_SYNC_END | DMA_BUF_SYNC_WRITE);
+            if (dense) {
+                extra->shared_layout = 3;
+                tensor->extra = extra;
+                ctx->q4_0_soa_tensors.insert(tensor);
+                return;
+            }
 
             cl_image_format img_format_q = {CL_R, CL_UNSIGNED_INT32};
             cl_image_desc img_desc_q = {
@@ -14490,6 +14540,7 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
                 // Transpose q and d as ushort
                 transpose_2d_as_16b(backend_ctx, extra->q, extra->q, size_q, K/4, M);
                 transpose_2d_as_16b(backend_ctx, extra->d, extra->d, size_d, K/32, M);
+                extra->shared_layout = 3;
             }
         }
 #endif // GGML_OPENCL_USE_ADRENO_KERNELS

@@ -229,6 +229,12 @@ static inline size_t htp_mm_round_up(size_t n, size_t m) {
     return ((n + m - 1) / m) * m;
 }
 
+// XQ4D: largest n chunk whose raw span staging (2 buffers of >= 2 chunks) fits the aux VTCM page
+static inline uint32_t htp_mm_xq4d_max_n_chunk(uint32_t k, size_t aux_bytes) {
+    const size_t per_col = (size_t) k / 2 + (size_t) k / 16;
+    return (uint32_t) (aux_bytes / (4 * per_col)) & ~31u;
+}
+
 static inline bool htp_mm_hmx_pipeline(uint32_t m) {
     return m > 32;
 }
@@ -241,7 +247,8 @@ static inline void htp_mm_hmx_get_2d_chunk_costs(
     const size_t row_stride = htp_tensor_get_row_size(wtype, k);
     const size_t vec_dot_size = k * sizeof(uint16_t);
     const uint32_t n_weight_tiles = k / htp_tensor_get_tile_k(wtype);
-    const size_t qweight_row_stride = is_quant ? (size_t)(n_weight_tiles * aligned_tile_size) / 32 : 0;
+    // XQ4D raw weights are staged in the aux VTCM page (see htp_xq_span), not in the HMX page
+    const size_t qweight_row_stride = (is_quant && wtype != HTP_TYPE_XQ4D_0) ? (size_t)(n_weight_tiles * aligned_tile_size) / 32 : 0;
 
     *size_per_n_out = (pipeline ? 2 : 1) * (is_quant ? qweight_row_stride : row_stride) +
                       (pipeline ? 2 * vec_dot_size : vec_dot_size);
@@ -385,7 +392,8 @@ static inline void htp_mm_hmx_vtcm_layout_build(
         const uint32_t n_weight_tiles = k / htp_tensor_get_tile_k(wtype);
 
         const size_t min_f32_size = hex_align_up(act_hvx * HTP_MM_DMA_ACT_MULTIPLIER * k * sizeof(float), 128);
-        const size_t weight_area_size = is_quant
+        const size_t weight_area_size = wtype == HTP_TYPE_XQ4D_0 ? HTP_MM_HMX_TILE_SIZE   // raw in the aux page
+            : is_quant
             ? hex_align_up((nc / 32) * n_weight_tiles * aligned_tile_size, HTP_MM_HMX_TILE_SIZE)
             : hex_align_up(nc * row_stride, HTP_MM_HMX_TILE_SIZE);
         const size_t act_area_size    = hex_align_up(mc * vec_dot_size, HTP_MM_HMX_TILE_SIZE);

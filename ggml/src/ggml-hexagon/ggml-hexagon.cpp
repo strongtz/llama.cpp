@@ -1501,7 +1501,7 @@ struct ggml_hexagon_opbatch {
             h.size  = ggml_nbytes(t);
         }
 
-        h.flags = flags & (HTP_TENSOR_WEIGHT | HTP_TENSOR_TILED | HTP_TENSOR_FENCE | HTP_TENSOR_XQ4);
+        h.flags = flags & (HTP_TENSOR_WEIGHT | HTP_TENSOR_TILED | HTP_TENSOR_FENCE | HTP_TENSOR_XQ4 | HTP_TENSOR_XQ4D);
     }
 
     static uint64_t hash_tensor(const ggml_tensor * t, const htp_tensor & shape) {
@@ -2747,7 +2747,44 @@ static inline bool ggml_hexagon_op_is_compute(const struct ggml_tensor * node) {
     return !ggml_op_is_empty(node->op) && !ggml_is_empty(node) && (node->flags & GGML_TENSOR_FLAG_COMPUTE);
 }
 
+// debug / benchmarking: lay out q4_0 weights like the OpenCL dense shared layout (XQ4D) in NPU memory
+static bool ggml_hexagon_tensor_to_xq4d(ggml_tensor * t) {
+    const int64_t K = t->ne[0], M = t->ne[1];
+    const int64_t nb = K / 32;
+    const size_t size_d = (size_t) M * nb * 2;
+    if (t->type != GGML_TYPE_Q4_0 || t->ne[2] != 1 || t->ne[3] != 1 || K % 32 != 0 || M % 32 != 0 || size_d % HTP_XQ4_ALIGN != 0) {
+        return false;
+    }
+    std::vector<uint8_t> raw(ggml_nbytes(t));
+    memcpy(raw.data(), t->data, raw.size());
+    const block_q4_0 * src = (const block_q4_0 *) raw.data();
+    ggml_fp16_t * d = (ggml_fp16_t *) t->data;
+    uint16_t    * q = (uint16_t *) ((uint8_t *) t->data + size_d);
+    for (int64_t r = 0; r < M; ++r) {
+        for (int64_t kb = 0; kb < nb; ++kb) {
+            const block_q4_0 & b = src[r * nb + kb];
+            d[kb * M + r] = b.d;
+            uint8_t post[16];
+            for (int i = 0; i < 8; ++i) {
+                const uint8_t x0 = b.qs[2 * i + 0], x1 = b.qs[2 * i + 1];
+                post[i + 0] = (uint8_t) ((x0 & 0x0F) | ((x1 & 0x0F) << 4));
+                post[i + 8] = (uint8_t) ((x0 >> 4) | (x1 & 0xF0));
+            }
+            for (int j = 0; j < 8; ++j) {
+                q[(kb * 8 + j) * M + r] = (uint16_t) (post[2 * j] | (post[2 * j + 1] << 8));
+            }
+        }
+    }
+    ggml_hexagon_tensor_set_flags(t, HTP_TENSOR_XQ4D);
+    return true;
+}
+
 static void ggml_hexagon_tensor_repack(ggml_tensor * tensor, ggml_hexagon_session * sess) {
+    static const bool force_xq4d = getenv("GGML_HEXAGON_FORCE_XQ4D") && atoi(getenv("GGML_HEXAGON_FORCE_XQ4D")) != 0;
+    if (force_xq4d && tensor->data && !ggml_hexagon_tensor_is_tiled(tensor) && !ggml_hexagon_tensor_is_xq4(tensor) &&
+        ggml_hexagon_tensor_can_tile(tensor) && ggml_hexagon_tensor_to_xq4d(tensor)) {
+        return;
+    }
     if (tensor->data == nullptr || ggml_hexagon_tensor_is_tiled(tensor) || !ggml_hexagon_tensor_can_tile(tensor)) {
         return;
     }
@@ -3624,11 +3661,17 @@ static ggml_backend_buffer_type_t ggml_backend_hexagon_shared_buffer_type(ggml_b
 
 // Point a q4_0 weight (placed in the shared buffer type) at memory of another device:
 //   fd/base/size : the dma-buf (mmap'ed at base in this process)
-//   d_off/q_off  : offsets of the scales [n_mat][K/32][M] (fp16) and quants [n_mat][K/8][M] (u32)
+//   d_off/q_off  : offsets of the scales [n_mat][K/32][M] (fp16) and quants
+//   layout       : 1/2 quants [n_mat][K/8][M] (u32, XQ4), 3 quants [K/4][M] (u16, XQ4D, dense only)
 static bool ggml_backend_hexagon_bind_xq4(ggml_backend_dev_t dev, ggml_tensor * t, int fd, void * base, size_t size,
-                                          size_t d_off, size_t q_off) {
+                                          size_t d_off, size_t q_off, int layout) {
     auto dev_ctx = static_cast<ggml_backend_hexagon_device_context *>(dev->context);
-    if (t->type != GGML_TYPE_Q4_0 || t->ne[0] % 32 != 0 || t->ne[1] % 32 != 0 || t->ne[3] != 1) {
+    if (t->type != GGML_TYPE_Q4_0 || t->ne[0] % 32 != 0 || t->ne[1] % 32 != 0 || t->ne[3] != 1 ||
+        layout < 1 || layout > 3 || (layout == 3 && t->ne[2] != 1)) {
+        return false;
+    }
+    // XQ4D stages its raw weights in the second VTCM page (v68 only)
+    if (layout == 3 && opt_arch >= 73) {
         return false;
     }
     const size_t size_d = (size_t) ggml_nelements(t) / 32 * 2;
@@ -3650,7 +3693,7 @@ static bool ggml_backend_hexagon_bind_xq4(ggml_backend_dev_t dev, ggml_tensor * 
     }
     t->buffer = buf;
     t->data   = (uint8_t *) base + d_off;
-    t->extra  = (void *) (uintptr_t) (HTP_TENSOR_WEIGHT | HTP_TENSOR_XQ4);
+    t->extra  = (void *) (uintptr_t) (HTP_TENSOR_WEIGHT | (layout == 3 ? HTP_TENSOR_XQ4D : HTP_TENSOR_XQ4));
     return true;
 }
 

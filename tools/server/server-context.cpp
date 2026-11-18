@@ -1277,7 +1277,7 @@ private:
         struct shared_q4_0 { int fd; void * base; size_t size; size_t d_off; size_t q_off; int layout; };
         typedef bool (*get_shared_fn_t)(const ggml_tensor *, shared_q4_0 *);
         typedef ggml_backend_buffer_type_t (*shared_buft_fn_t)(ggml_backend_dev_t);
-        typedef bool (*bind_fn_t)(ggml_backend_dev_t, ggml_tensor *, int, void *, size_t, size_t, size_t);
+        typedef bool (*bind_fn_t)(ggml_backend_dev_t, ggml_tensor *, int, void *, size_t, size_t, size_t, int);
         std::vector<std::pair<std::string, shared_q4_0>> shared;
         std::vector<std::string> patterns;
         std::vector<llama_model_tensor_buft_override> overrides;
@@ -1296,7 +1296,7 @@ private:
                     const ggml_tensor * t = llama_model_weight_tensor(model_tgt, i);
                     shared_q4_0 info;
                     // the token embedding stays on the CPU in the NPU model
-                    if (!t || strstr(t->name, "token_embd") || !get_shared(t, &info)) {
+                    if (!t || strstr(t->name, "token_embd") || !strcmp(t->name, "output.weight") || !get_shared(t, &info)) {
                         continue;
                     }
                     const size_t size_d = (size_t) ggml_nelements(t) / 32 * 2;
@@ -1345,7 +1345,7 @@ private:
         for (const auto & it : shared) {
             ggml_tensor * t = llama_model_weight_tensor_by_name(model_npu, it.first.c_str());
             const auto & info = it.second;
-            if (!t || !bind_fn(dev, t, info.fd, info.base, info.size, info.d_off, info.q_off)) {
+            if (!t || !bind_fn(dev, t, info.fd, info.base, info.size, info.d_off, info.q_off, info.layout)) {
                 SRV_ERR("NPU prefill: failed to bind shared weight %s\n", it.first.c_str());
                 return false;
             }
