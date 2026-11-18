@@ -234,8 +234,11 @@ __kernel void kernel_gemv_noshuffle_q4_0_f32(
 
     __private float2 totalSum = (float2)(0.0f);
 
-    // loop along K in block granularity, skip 4 blocks every iter
-    for (uint k = groupId; k < (K / QK4_0); k += N_SIMDGROUP) {
+    uint nsg = get_local_size(1);  // runtime K-split, layout stride stays 4*M
+    MATERIALIZE_WG(nsg);
+
+    // loop along K in block granularity, skip nsg blocks every iter
+    for (uint k = groupId; k < (K / QK4_0); k += nsg) {
         regS = src0_d[gid_s + k * LINE_STRIDE_A]; // each fiber loads scale of two rows
         // first 4 fibers in each wave load 8 B values to its private scope
         if (slid < 4) {
@@ -265,15 +268,13 @@ __kernel void kernel_gemv_noshuffle_q4_0_f32(
 #endif // VECTOR_SUB_GROUP_BROADCAST
     }
 
-    // reduction in local memory, assumes #wave=4
-    __local float2 reduceLM[SIMDGROUP_WIDTH * 3];
-    if (groupId == 1) reduceLM[SIMDGROUP_WIDTH * 0 + slid] = totalSum;
-    if (groupId == 2) reduceLM[SIMDGROUP_WIDTH * 1 + slid] = totalSum;
-    if (groupId == 3) reduceLM[SIMDGROUP_WIDTH * 2 + slid] = totalSum;
+    // reduction in local memory over nsg waves (nsg <= 16)
+    __local float2 reduceLM[SIMDGROUP_WIDTH * 15];
+    if (groupId > 0) reduceLM[SIMDGROUP_WIDTH * (groupId - 1) + slid] = totalSum;
     barrier(CLK_LOCAL_MEM_FENCE);
-    if (groupId == 0) totalSum += reduceLM[SIMDGROUP_WIDTH * 0 + slid];
-    if (groupId == 0) totalSum += reduceLM[SIMDGROUP_WIDTH * 1 + slid];
-    if (groupId == 0) totalSum += reduceLM[SIMDGROUP_WIDTH * 2 + slid];
+    if (groupId == 0) {
+        for (uint g = 1; g < nsg; g++) totalSum += reduceLM[SIMDGROUP_WIDTH * (g - 1) + slid];
+    }
 
     // 2 outputs per fiber in wave 0
     if (groupId == 0) {

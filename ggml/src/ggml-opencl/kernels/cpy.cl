@@ -398,3 +398,34 @@ kernel void kernel_cpy_f32_i32(
         out[0] = convert_int_rtz(src[0]);
     }
 }
+
+// one work item per element, arbitrary strides (for short rows where the row-mapped kernel
+// would launch tiny workgroups)
+kernel void kernel_cpy_f32_f32_elem(
+        global char * src0,
+        ulong offset0,
+        global char * dst,
+        ulong offsetd,
+        int ne00, int ne01, int ne02, int ne03,
+        ulong nb00, ulong nb01, ulong nb02, ulong nb03,
+        int ne0, int ne1, int ne2, int ne3,
+        ulong nb0, ulong nb1, ulong nb2, ulong nb3
+) {
+    const long n = get_global_id(0);
+    const long ntot = (long) ne00*ne01*ne02*ne03;
+    if (n >= ntot) {
+        return;
+    }
+    long t = n;
+    const int i00 = t % ne00; t /= ne00;
+    const int i01 = t % ne01; t /= ne01;
+    const int i02 = t % ne02; t /= ne02;
+    const int i03 = t;
+    t = n;
+    const int i0 = t % ne0; t /= ne0;
+    const int i1 = t % ne1; t /= ne1;
+    const int i2 = t % ne2; t /= ne2;
+    const int i3 = t;
+    *(global float *)(dst + offsetd + i3*nb3 + i2*nb2 + i1*nb1 + i0*nb0) =
+        *(global float *)(src0 + offset0 + i03*nb03 + i02*nb02 + i01*nb01 + i00*nb00);
+}

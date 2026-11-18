@@ -3095,6 +3095,8 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         }
         return is_rdna3_or_4 ? 4u : rows;
     };
+    if (const char * e = getenv("GGML_VK_DMMV_RM_STDQ")) { rm_stdq = std::max(1, atoi(e)); }
+    if (const char * e = getenv("GGML_VK_DMMV_RM_KQ"))   { rm_kq   = std::max(1, atoi(e)); }
     uint32_t rm_iq = 2 * rm_kq;
 
     const bool use_subgroups = device->subgroup_arithmetic;
@@ -3105,7 +3107,13 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     // Ensure a subgroup size >= 16 is available
     const bool use_subgroups16 = use_subgroups && subgroup_min_size_16 && !is_imagination_proprietary;
 
-    const uint32_t subgroup_size = (device->vendor_id == VK_VENDOR_ID_INTEL && device->subgroup_size_control && device->subgroup_min_size <= 16 && device->subgroup_max_size >= 16) ? 16 : device->subgroup_size;
+    uint32_t subgroup_size = (device->vendor_id == VK_VENDOR_ID_INTEL && device->subgroup_size_control && device->subgroup_min_size <= 16 && device->subgroup_max_size >= 16) ? 16 : device->subgroup_size;
+    if (const char * e = getenv("GGML_VK_DMMV_SUBGROUP")) {
+        const uint32_t v = atoi(e);
+        if (device->subgroup_size_control && v >= device->subgroup_min_size && v <= device->subgroup_max_size) {
+            subgroup_size = v;
+        }
+    }
     const uint32_t subgroup_size16 = std::max(subgroup_size, 16u);
 
     const uint32_t force_subgroup_size = use_subgroups ? subgroup_size : 0;

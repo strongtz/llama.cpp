@@ -13074,6 +13074,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     // MLA shape: the V cache is a sub-view of the K cache, with quantized KV
     test_cases.emplace_back(new test_flash_attn_ext(576, 512, 1, {8, 1},  113,   1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, true));
+    // Ling-3.0-tiny MLA absorbed projections (per-head batched matmuls)
+    for (int n : {1, 4, 64}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, 512, n, 128, {16, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, 128, n, 512, {16, 1}, {1, 1}));
+        // non-contiguous src1 (q view permuted), as in the model graph
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, 512, n, 128, {16, 1}, {1, 1}, {0, 1, 2, 3}, 192));
+    }
+    // Ling-3.0-tiny MLA decode (16 heads, one shared latent KV head)
+    for (int kv : {7, 113, 512, 1000, 4096}) {
+        test_cases.emplace_back(new test_flash_attn_ext(576, 512, 1, {16, 1}, kv, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, true));
+    }
     test_cases.emplace_back(new test_flash_attn_ext(576, 512, 1, {8, 1}, 1024,   1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, true));
     test_cases.emplace_back(new test_flash_attn_ext(576, 512, 1, {8, 1}, 1024,  64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, true));
     test_cases.emplace_back(new test_flash_attn_ext(576, 512, 1, {8, 1}, 4096,  24, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, true));
@@ -13390,6 +13401,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_moe_reduce(2048, 15, 40, false, true));
     test_cases.emplace_back(new test_moe_reduce(2048, 16, 32, false, true));
 
+    // Ling-3.0-tiny KDA shapes
+    for (int nt : {1, 2, 3, 4, 8, 64}) {
+        test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, nt, 1, 1, false, true));
+        test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, nt, 1, 1, true, true));
+    }
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 1, 1));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 16, 1, 1));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 16, 1, 1, 1, true, true));
@@ -13491,6 +13507,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     for (float n : {128.0f, 4096.0f, 32768.0f, 1048576.0f}) {
         test_cases.emplace_back(new test_arange(GGML_TYPE_F32, 0.0f, n, 1.0f));
     }
+
+    // Ling-3.0-tiny MLA decode attention
+    for (int kv : {512, 4096, 16384}) {
+        test_cases.emplace_back(new test_flash_attn_ext(576, 512, 1, {16, 1}, kv, 1, true, false, 0.0f, 0.0f, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, true));
+    }
+    // Ling-3.0-tiny decode shapes
+    for (auto [m, k] : std::vector<std::pair<int,int>>{{2048,1536},{1536,2048},{512,1536},{4608,1536},{576,1536}}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, m, 1, k, {1, 1}, {1, 1}));
+    }
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_0, GGML_TYPE_F32, 128, 8, false, 512, 1, 1536));
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_0, GGML_TYPE_F32, 128, 8, false, 1536, 1, 512));
 
     // LoRA at prefill: B is [rank, n_out], so K = rank
     for (int64_t k : {16, 32, 48, 64}) {

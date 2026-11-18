@@ -114,7 +114,10 @@ inline void mul_vec_q_n_f32_8x_flat(
         int ne0,
         int ne1,
         int r2,
-        int r3
+        int r3,
+        ulong nb11,
+        ulong nb12,
+        ulong nb13
 ) {
     const ulong nb = ne00/QK4_0;
 
@@ -139,7 +142,7 @@ inline void mul_vec_q_n_f32_8x_flat(
 
     global uchar * x = (global uchar *) src0_q + offset0_q;
     global half  * d = (global half  *) src0_d + offset0_d;
-    global float * y = (global float *) src1   + r1*ne10 + im*ne00*ne1;
+    global float * y = (global float *) ((global char *) src1 + r1*nb11 + i12*nb12 + i13*nb13);
 
     float16 yl;
     float8 sumf = 0.f;
@@ -263,10 +266,13 @@ kernel void kernel_mul_mat_q4_0_f32_8x_flat(
         int ne0,
         int ne1,
         int r2,
-        int r3
+        int r3,
+        ulong nb11,
+        ulong nb12,
+        ulong nb13
 ) {
     src1 = (global float*)((global char*)src1 + offset1);
     dst = (global float*)((global char*)dst + offsetd);
 
-    mul_vec_q_n_f32_8x_flat(src0_q, src0_d, src1, dst, ne00, ne01, ne02, ne10, ne12, ne0, ne1, r2, r3);
+    mul_vec_q_n_f32_8x_flat(src0_q, src0_d, src1, dst, ne00, ne01, ne02, ne10, ne12, ne0, ne1, r2, r3, nb11, nb12, nb13);
 }
