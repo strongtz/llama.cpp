@@ -89,6 +89,7 @@ size_t opt_vtcm_size  = 0; // VTCM size override in bytes; 0 = auto-detect
 
 #define HTP_V68_VTCM_PAGE_SIZE (4u * 1024 * 1024)
 size_t opt_vmem       = HTP_OP_MAX_VMEM_DEFAULT;  // max available va space for buffer mappings
+int    opt_vmem_budget = -1; // map buffers on demand within opt_vmem (-1: auto, enabled for arch < 73)
 int    opt_etm        = 0;
 int    opt_verbose    = 0;
 int    opt_profile    = 0; // profiling mode (0-disabled, 1-basic, 2-pmu)
@@ -320,6 +321,8 @@ struct ggml_hexagon_session {
     ggml_hexagon_opqueue* op_queue;
 
     std::unordered_set<ggml_hexagon_shared_buffer *>                     buffers;
+    size_t   mapped_vmem = 0;   // bytes currently mapped into the DSP/SMMU address space
+    uint64_t use_clock   = 0;
     std::unordered_map<int, std::unique_ptr<ggml_hexagon_shared_buffer>> cloned_buffers;
     std::unordered_set<ggml_hexagon_session *>                           virt_peers;
     std::unordered_set<ggml_hexagon_session *>                           phys_peers;
@@ -379,6 +382,7 @@ struct ggml_hexagon_session {
     void flush_pending(bool all = true);
 
     void mmap_buffers();
+    void mmap_buffers_budgeted();
     void clone_buffer(const ggml_hexagon_shared_buffer*);
     void release_buffer(const ggml_hexagon_shared_buffer*);
     void unclone_buffer(const ggml_hexagon_shared_buffer*);
@@ -467,6 +471,8 @@ struct ggml_hexagon_shared_buffer {
     bool     mapped;
     bool     pinned;
     bool     extended;
+    bool     is_weight = false;
+    uint64_t last_use  = 0;
 
     const char * c_name() const { return sess->c_name(); }
     uint8_t *    base()   const { return mem ? mem->base : nullptr; }
@@ -474,8 +480,14 @@ struct ggml_hexagon_shared_buffer {
     int          fd()     const { return mem ? mem->fd   : -1; }
 
     void mmap() {
-        if (!this->mem)   return;
-        if (this->mapped) return;
+        if (!try_mmap()) {
+            throw std::runtime_error("ggml-hex: fastrpc_mmap failed (see log for details)");
+        }
+    }
+
+    bool try_mmap(bool quiet = false) {
+        if (!this->mem)   return true;
+        if (this->mapped) return true;
 
         GGML_ASSERT(!this->pinned || !this->extended);
 
@@ -492,19 +504,27 @@ struct ggml_hexagon_shared_buffer {
         }
 
         if (err != 0) {
-            GGML_LOG_ERROR("ggml-hex: %s buffer mapping failed : domain_id %d size %zu fd %d error 0x%08x\n", sess->c_name(),
-                    sess->domain_id, size(), fd(), (unsigned) err);
+            if (quiet) {
+                return false;
+            }
+            GGML_LOG_ERROR("ggml-hex: %s buffer mapping failed : domain_id %d size %zu fd %d error 0x%08x (mapped %zu)\n", sess->c_name(),
+                    sess->domain_id, size(), fd(), (unsigned) err, sess_mapped_vmem());
             if (!this->pinned) {
                 GGML_LOG_ERROR("ggml-hex: %s possibly out of IOVA space, try --no-host\n", sess->c_name());
             }
-            throw std::runtime_error("ggml-hex: fastrpc_mmap failed (see log for details)");
+            return false;
         }
 
         HEX_VERBOSE("ggml-hex: %s mapped buffer: base %p size %zu fd %d pinned %u extended %u\n",
                 sess->c_name(), (void *) base(), size(), fd(), pinned, extended);
 
         this->mapped = true;
+        sess_account(+(ssize_t) size());
+        return true;
     }
+
+    size_t sess_mapped_vmem() const;
+    void   sess_account(ssize_t delta);
 
     void unmap() {
         if (!this->mapped) return;
@@ -522,6 +542,7 @@ struct ggml_hexagon_shared_buffer {
                 (void *) base(), size(), fd());
 
         this->mapped = false;
+        sess_account(-(ssize_t) size());
     }
 
     void alloc(size_t size) {
@@ -1876,7 +1897,8 @@ void ggml_hexagon_session::enqueue_op(const htp_opnode & node) {
         if (!t) return;
         auto * sbuf = static_cast<ggml_hexagon_shared_buffer *>(t->buffer->context);
         if (ggml_backend_buffer_get_usage(t->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
-            sbuf->extended = opt_dma64;
+            sbuf->extended  = opt_dma64;
+            sbuf->is_weight = true;
         }
         if (sbuf->sess == this) {
             if (!sbuf->mapped) {
@@ -2005,7 +2027,83 @@ void ggml_hexagon_session::enqueue_allreduce(
     this->enqueue_op(ar_node);
 }
 
+size_t ggml_hexagon_shared_buffer::sess_mapped_vmem() const { return sess->mapped_vmem; }
+void   ggml_hexagon_shared_buffer::sess_account(ssize_t delta) { sess->mapped_vmem += delta; }
+
+// Map only the buffers referenced by the current batch and keep the total amount of
+// mapped memory within the IOVA budget (opt_vmem). Needed on targets with a 32-bit
+// DSP SMMU window (e.g. v68 / SC8280XP) where the model does not fit at once.
+// Weights are evicted most-recently-used first (layers are visited cyclically),
+// everything else least-recently-used.
+void ggml_hexagon_session::mmap_buffers_budgeted() {
+    const uint64_t now = ++this->use_clock;
+
+    std::vector<ggml_hexagon_shared_buffer *> need;
+    size_t need_size = 0;
+    for (unsigned int i = 0; i < op_batch->n_bufs; i++) {
+        const int fd = (int) op_batch->h_bufs[i].fd;
+        for (auto * sbuf : this->buffers) {
+            if (sbuf->fd() == fd) {
+                sbuf->last_use = now;
+                if (!sbuf->mapped) {
+                    need.push_back(sbuf);
+                    need_size += sbuf->size();
+                }
+                break;
+            }
+        }
+    }
+    if (need.empty()) return;
+
+    std::sort(need.begin(), need.end(), [](const auto * a, const auto * b) { return a->size() > b->size(); });
+
+    bool flushed = false;
+    auto evict_one = [&]() -> bool {
+        ggml_hexagon_shared_buffer * victim = nullptr;
+        for (auto * sbuf : this->buffers) {
+            if (!sbuf->mapped || sbuf->pinned || sbuf->last_use == now) continue;
+            if (!victim) { victim = sbuf; continue; }
+            if (sbuf->is_weight != victim->is_weight) {
+                if (sbuf->is_weight) victim = sbuf;   // prefer evicting weights
+                continue;
+            }
+            if (sbuf->is_weight ? (sbuf->last_use > victim->last_use) : (sbuf->last_use < victim->last_use)) {
+                victim = sbuf;
+            }
+        }
+        if (!victim) return false;
+        if (!flushed) {
+            // in-flight batches may still reference the victim
+            flush_pending(true);
+            flushed = true;
+        }
+        HEX_VERBOSE("ggml-hex: %s evict buffer fd %d size %zu weight %d\n", c_name(), victim->fd(), victim->size(), victim->is_weight);
+        victim->unmap();
+        return true;
+    };
+
+    while (this->mapped_vmem + need_size > opt_vmem) {
+        if (!evict_one()) break;
+    }
+
+    for (auto * sbuf : need) {
+        while (!sbuf->try_mmap(true)) {
+            // IOVA fragmentation: free more space and retry
+            if (!evict_one()) {
+                if (!sbuf->try_mmap(false)) {
+                    throw std::runtime_error("ggml-hex: fastrpc_mmap failed (see log for details)");
+                }
+                break;
+            }
+        }
+    }
+}
+
 void ggml_hexagon_session::mmap_buffers() {
+    if (opt_vmem_budget) {
+        mmap_buffers_budgeted();
+        return;
+    }
     auto collect_session = [](ggml_hexagon_session * sess, std::unordered_set<ggml_hexagon_shared_buffer *> & unmapped) {
         for (auto * sbuf : sess->buffers) {
             if (!sbuf->mapped) {
@@ -3560,6 +3658,7 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
     const char * str_ndev     = getenv("GGML_HEXAGON_NDEV");
     const char * str_arch     = getenv("GGML_HEXAGON_ARCH");
     const char * str_vmem     = getenv("GGML_HEXAGON_VMEM");
+    const char * str_vmem_budget = getenv("GGML_HEXAGON_VMEM_BUDGET");
     const char * str_mbuf     = getenv("GGML_HEXAGON_MBUF");
     const char * str_optrace  = getenv("GGML_HEXAGON_OPTRACE");
     const char * str_hostbuf  = getenv("GGML_HEXAGON_HOSTBUF");
@@ -3644,6 +3743,13 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
         }
     }
     opt_vmem    = str_vmem    ? parse_size(str_vmem)   : opt_vmem;
+    opt_vmem_budget = str_vmem_budget ? atoi(str_vmem_budget) : (opt_arch < 73 ? 1 : 0);
+    if (opt_arch < 73 && !str_mbuf) {
+        // v68: 32-bit SMMU window, IOVA allocations are power-of-two aligned.
+        // Keep every buffer (including its guard page) just below 256MB.
+        opt_mbuf_dyn    = 256ul * 1024 * 1024 - 16 * 1024;
+        opt_mbuf_static = 256ul * 1024 * 1024 - 16 * 1024;
+    }
     opt_hostbuf = str_hostbuf ? atoi(str_hostbuf) != 0 : opt_hostbuf;
 
     // Parse device configuration

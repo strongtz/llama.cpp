@@ -1021,6 +1021,18 @@ static void fa_phase_q_load(struct hmx_fa_context *   factx,
     args.q_transposed = q->nb[1] < q->nb[2];
     atomic_init(&args.barrier, n);
     work_queue_run(wp, fa_q_load_thread, &args, n);
+
+#if __HVX_ARCH__ < 73
+    // v68: the HMX convert stage has no output scale, fold the softmax scale into Q instead
+    {
+        const size_t n_el = (size_t) hex_align_up(factx->g_br, 32) * factx->DK_pad;
+        HVX_Vector * v = (HVX_Vector *) factx->vtcm_q_tiles;
+        const HVX_Vector v_sc = hvx_vec_splat_f16(factx->scale);
+        for (size_t i = 0; i < n_el / 64; i++) {
+            v[i] = Q6_Vhf_equals_Vqf16(Q6_Vqf16_vmpy_VhfVhf(v[i], v_sc));
+        }
+    }
+#endif
 }
 
 typedef struct {
