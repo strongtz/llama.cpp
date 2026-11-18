@@ -9360,6 +9360,295 @@ static void ggml_flash_attn_ext_reduce_partials(
     }
 }
 
+#if defined(__ARM_NEON) && defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC)
+#include <arm_neon.h>
+#define GGML_FA_GROUPED_NEON_F16 1
+
+// scores[h*B + r] = dot(Q[h], K[r]) for 4 heads x 4 rows at a time, fp16 FMA with
+// periodic fp32 accumulation to bound the rounding error
+static inline void ggml_fa_neon_kq_4x4(const __fp16 * q0, const __fp16 * q1, const __fp16 * q2, const __fp16 * q3,
+                                       const __fp16 * const * kr, int64_t DK, float out[4][4]) {
+    float32x4_t f[4][4];
+    for (int i = 0; i < 4; i++) for (int j = 0; j < 4; j++) f[i][j] = vdupq_n_f32(0.0f);
+    const __fp16 * qs[4] = { q0, q1, q2, q3 };
+    for (int64_t d0 = 0; d0 < DK; d0 += 64) {
+        const int64_t d1 = d0 + 64 < DK ? d0 + 64 : DK;
+        float16x8_t a[4][4];
+        for (int i = 0; i < 4; i++) for (int j = 0; j < 4; j++) a[i][j] = vdupq_n_f16(0);
+        for (int64_t d = d0; d < d1; d += 8) {
+            const float16x8_t k0 = vld1q_f16(kr[0] + d);
+            const float16x8_t k1 = vld1q_f16(kr[1] + d);
+            const float16x8_t k2 = vld1q_f16(kr[2] + d);
+            const float16x8_t k3 = vld1q_f16(kr[3] + d);
+            for (int i = 0; i < 4; i++) {
+                const float16x8_t qv = vld1q_f16(qs[i] + d);
+                a[i][0] = vfmaq_f16(a[i][0], qv, k0);
+                a[i][1] = vfmaq_f16(a[i][1], qv, k1);
+                a[i][2] = vfmaq_f16(a[i][2], qv, k2);
+                a[i][3] = vfmaq_f16(a[i][3], qv, k3);
+            }
+        }
+        for (int i = 0; i < 4; i++) for (int j = 0; j < 4; j++) {
+            f[i][j] = vaddq_f32(f[i][j], vcvt_f32_f16(vget_low_f16(a[i][j])));
+            f[i][j] = vaddq_f32(f[i][j], vcvt_high_f32_f16(a[i][j]));
+        }
+    }
+    for (int i = 0; i < 4; i++) for (int j = 0; j < 4; j++) out[i][j] = vaddvq_f32(f[i][j]);
+}
+
+// acc[h][DV] (fp32) += sum_r p[h][r] * V[r] for 4 heads, rows accumulated in fp16
+static inline void ggml_fa_neon_pv_4(float * const * acc, const __fp16 * const * pr, const __fp16 * const * vr,
+                                     int64_t nr, int64_t DV) {
+    for (int64_t d = 0; d < DV; d += 16) {
+        float16x8_t a[4][2];
+        for (int i = 0; i < 4; i++) { a[i][0] = vdupq_n_f16(0); a[i][1] = vdupq_n_f16(0); }
+        for (int64_t r = 0; r < nr; r++) {
+            const float16x8_t v0 = vld1q_f16(vr[r] + d);
+            const float16x8_t v1 = vld1q_f16(vr[r] + d + 8);
+            for (int i = 0; i < 4; i++) {
+                const __fp16 pv = pr[i][r];
+                a[i][0] = vfmaq_n_f16(a[i][0], v0, pv);
+                a[i][1] = vfmaq_n_f16(a[i][1], v1, pv);
+            }
+        }
+        for (int i = 0; i < 4; i++) {
+            float * o = acc[i] + d;
+            vst1q_f32(o +  0, vaddq_f32(vld1q_f32(o +  0), vcvt_f32_f16(vget_low_f16(a[i][0]))));
+            vst1q_f32(o +  4, vaddq_f32(vld1q_f32(o +  4), vcvt_high_f32_f16(a[i][0])));
+            vst1q_f32(o +  8, vaddq_f32(vld1q_f32(o +  8), vcvt_f32_f16(vget_low_f16(a[i][1]))));
+            vst1q_f32(o + 12, vaddq_f32(vld1q_f32(o + 12), vcvt_high_f32_f16(a[i][1])));
+        }
+    }
+}
+#endif
+
+// Decode (single query row) split-KV path for heads sharing K/V (GQA/MQA/MLA):
+// walk the KV chunk in small blocks that stay in cache and process every query
+// head per block, instead of streaming the whole chunk once per head.
+static void ggml_compute_forward_flash_attn_ext_f16_decode_grouped(
+        const ggml_compute_params * params,
+        ggml_tensor * dst,
+        int64_t ic_start, int64_t ic_end,
+        float * partials, int64_t partial_stride,
+        float * scratch) {
+
+    const ggml_tensor * q     = dst->src[0];
+    const ggml_tensor * k     = dst->src[1];
+    const ggml_tensor * v     = dst->src[2];
+    const ggml_tensor * mask  = dst->src[3];
+    const ggml_tensor * sinks = dst->src[4];
+
+    GGML_TENSOR_LOCALS(int64_t, neq, q,   ne)
+    GGML_TENSOR_LOCALS(size_t,  nbq, q,   nb)
+    GGML_TENSOR_LOCALS(int64_t, nek, k,   ne)
+    GGML_TENSOR_LOCALS(size_t,  nbk, k,   nb)
+    GGML_TENSOR_LOCALS(int64_t, nev, v,   ne)
+    GGML_TENSOR_LOCALS(size_t,  nbv, v,   nb)
+
+    const int64_t DK = nek0;
+    const int64_t DV = nev0;
+    const int64_t H  = neq2;
+
+    const int64_t rk2 = neq2/nek2;
+    const int64_t rv2 = neq2/nev2;
+
+    float scale         = 1.0f;
+    float max_bias      = 0.0f;
+    float logit_softcap = 0.0f;
+
+    memcpy(&scale,         (float *) dst->op_params + 0, sizeof(float));
+    memcpy(&max_bias,      (float *) dst->op_params + 1, sizeof(float));
+    memcpy(&logit_softcap, (float *) dst->op_params + 2, sizeof(float));
+
+    if (logit_softcap != 0) {
+        scale /= logit_softcap;
+    }
+
+    const uint32_t n_head_log2 = 1u << (uint32_t) floor(log2(H));
+    const float m0 = powf(2.0f, -(max_bias       ) / n_head_log2);
+    const float m1 = powf(2.0f, -(max_bias / 2.0f) / n_head_log2);
+
+    ggml_type         const k_vec_dot_type = ggml_get_type_traits_cpu(k->type)->vec_dot_type;
+    ggml_from_float_t const q_to_vec_dot   = ggml_get_type_traits_cpu(k_vec_dot_type)->from_float;
+    ggml_vec_dot_t    const kq_vec_dot     = ggml_get_type_traits_cpu(k->type)->vec_dot;
+    const size_t            q_row_size     = ggml_row_size(k_vec_dot_type, DK);
+
+    // scratch layout: [H][DV] VKQ, [H] M, [H] S, [H][q_row_size] Q
+    float   * VKQ = scratch;
+    float   * Ms  = VKQ + H*DV;
+    float   * Ss  = Ms + H;
+    uint8_t * Qq  = (uint8_t *) (Ss + H);
+
+    for (int64_t h = 0; h < H; ++h) {
+        Ms[h] = -INFINITY;
+        Ss[h] = 0.0f;
+        memset(VKQ + h*DV, 0, DV*sizeof(float));
+        const float * pq = (const float *) ((const char *) q->data + h*nbq2);
+        q_to_vec_dot(pq, Qq + h*q_row_size, DK);
+    }
+
+    constexpr int64_t BLK = 32;
+    float sblk[BLK];
+
+#ifdef GGML_FA_GROUPED_NEON_F16
+    static const bool neon_grouped_disabled = getenv("GGML_FA_NO_NEON_GROUPED") != nullptr;
+    if (!neon_grouped_disabled && k->type == GGML_TYPE_F16 && v->type == GGML_TYPE_F16 &&
+        DK % 8 == 0 && DV % 16 == 0 && H % 4 == 0 && logit_softcap == 0.0f) {
+        // Q as fp16 [H][DK], reuses the Q scratch (sized for f32 rows)
+        __fp16 * Qh = (__fp16 *) Qq;
+        for (int64_t h = 0; h < H; ++h) {
+            const float * pq = (const float *) ((const char *) q->data + h*nbq2);
+            for (int64_t d = 0; d < DK; ++d) {
+                Qh[h*DK + d] = (__fp16) pq[d];
+            }
+        }
+        float  S_all[64][BLK];
+        __fp16 P_all[64][BLK];
+        GGML_ASSERT(H <= 64);
+
+        for (int64_t b0 = ic_start; b0 < ic_end; b0 += BLK) {
+            const int64_t nb = std::min(BLK, ic_end - b0);
+            const int64_t nb4 = (nb + 3) & ~3;
+
+            const __fp16 * krow[BLK];
+            const __fp16 * vrow[BLK];
+            for (int64_t r = 0; r < nb4; r++) {
+                const int64_t ic = b0 + std::min(r, nb - 1);
+                krow[r] = (const __fp16 *) ((const char *) k->data + ic*nbk1);
+                vrow[r] = (const __fp16 *) ((const char *) v->data + ic*nbv1);
+            }
+
+            // scores
+            for (int64_t h = 0; h < H; h += 4) {
+                for (int64_t r = 0; r < nb4; r += 4) {
+                    float o[4][4];
+                    ggml_fa_neon_kq_4x4(Qh + (h+0)*DK, Qh + (h+1)*DK, Qh + (h+2)*DK, Qh + (h+3)*DK, krow + r, DK, o);
+                    for (int i = 0; i < 4; i++) for (int j = 0; j < 4; j++) S_all[h+i][r+j] = o[i][j];
+                }
+            }
+
+            // online softmax update
+            for (int64_t h = 0; h < H; ++h) {
+                const float slope = (max_bias > 0.0f) ? h < (int64_t) n_head_log2 ? powf(m0, h + 1) : powf(m1, 2*(h - n_head_log2) + 1) : 1.0f;
+                const ggml_fp16_t * mp = mask ? (const ggml_fp16_t *)((const char *) mask->data + (h % mask->ne[2])*mask->nb[2]) : NULL;
+                float bmax = -INFINITY;
+                for (int64_t r = 0; r < nb; r++) {
+                    const float mv = mp ? slope*GGML_CPU_FP16_TO_FP32(mp[b0 + r]) : 0.0f;
+                    const float sc = (mv == -INFINITY) ? -INFINITY : S_all[h][r]*scale + mv;
+                    S_all[h][r] = sc;
+                    bmax = std::max(bmax, sc);
+                }
+                if (bmax > Ms[h]) {
+                    const float ms = expf(Ms[h] - bmax);
+                    if (Ss[h] != 0.0f) {
+                        ggml_vec_scale_f32(DV, VKQ + h*DV, ms);
+                    }
+                    Ss[h] *= ms;
+                    Ms[h] = bmax;
+                }
+                float sum = 0.0f;
+                for (int64_t r = 0; r < nb4; r++) {
+                    float pv = 0.0f;
+                    if (r < nb && S_all[h][r] != -INFINITY) {
+                        pv = expf(S_all[h][r] - Ms[h]);
+                    }
+                    sum += pv;
+                    P_all[h][r] = (__fp16) pv;
+                }
+                Ss[h] += sum;
+            }
+
+            // VKQ += P * V
+            for (int64_t h = 0; h < H; h += 4) {
+                float * acc[4] = { VKQ + (h+0)*DV, VKQ + (h+1)*DV, VKQ + (h+2)*DV, VKQ + (h+3)*DV };
+                const __fp16 * pr[4] = { P_all[h+0], P_all[h+1], P_all[h+2], P_all[h+3] };
+                ggml_fa_neon_pv_4(acc, pr, vrow, nb4, DV);
+            }
+        }
+    } else
+#endif
+    {
+
+    for (int64_t b0 = ic_start; b0 < ic_end; b0 += BLK) {
+        const int64_t b1 = std::min(b0 + BLK, ic_end);
+
+        for (int64_t h = 0; h < H; ++h) {
+            const float slope = (max_bias > 0.0f) ? h < (int64_t) n_head_log2 ? powf(m0, h + 1) : powf(m1, 2*(h - n_head_log2) + 1) : 1.0f;
+            const ggml_fp16_t * mp = mask ? (const ggml_fp16_t *)((const char *) mask->data + (h % mask->ne[2])*mask->nb[2]) : NULL;
+
+            const int64_t ik2 = h / rk2;
+            const int64_t iv2 = h / rv2;
+
+            // scores for the block
+            float bmax = -INFINITY;
+            for (int64_t ic = b0; ic < b1; ++ic) {
+                const float mv = mp ? slope*GGML_CPU_FP16_TO_FP32(mp[ic]) : 0.0f;
+                float s = -INFINITY;
+                if (mv != -INFINITY) {
+                    const char * k_data = (const char *) k->data + (ic*nbk1 + ik2*nbk2);
+                    kq_vec_dot(DK, &s, 0, k_data, 0, Qq + h*q_row_size, 0, 1);
+                    s = s*scale;
+                    if (logit_softcap != 0.0f) {
+                        s = logit_softcap*tanhf(s);
+                    }
+                    s += mv;
+                }
+                sblk[ic - b0] = s;
+                bmax = std::max(bmax, s);
+            }
+            if (bmax == -INFINITY) {
+                continue;
+            }
+
+            float * acc = VKQ + h*DV;
+            if (bmax > Ms[h]) {
+                const float ms = expf(Ms[h] - bmax);
+                if (Ss[h] != 0.0f) {
+                    ggml_vec_scale_f32(DV, acc, ms);
+                }
+                Ss[h] *= ms;
+                Ms[h] = bmax;
+            }
+            const float M = Ms[h];
+            float S = 0.0f;
+            for (int64_t ic = b0; ic < b1; ++ic) {
+                const float sc = sblk[ic - b0];
+                if (sc == -INFINITY) {
+                    continue;
+                }
+                const float vs = expf(sc - M);
+                S += vs;
+                const char * v_data = (const char *) v->data + (ic*nbv1 + iv2*nbv2);
+                if (v->type == GGML_TYPE_F16) {
+                    ggml_vec_mad_f16_f32(DV, acc, (const ggml_fp16_t *) v_data, vs);
+                } else {
+                    ggml_vec_mad_f32(DV, acc, (const float *) v_data, vs);
+                }
+            }
+            Ss[h] += S;
+        }
+    }
+    }
+
+    for (int64_t h = 0; h < H; ++h) {
+        if (sinks && ic_start == 0) {
+            const float sv = ((const float *) sinks->data)[h];
+            if (sv > Ms[h]) {
+                const float ms = expf(Ms[h] - sv);
+                ggml_vec_scale_f32(DV, VKQ + h*DV, ms);
+                Ss[h] = Ss[h]*ms + 1.0f;
+                Ms[h] = sv;
+            } else {
+                Ss[h] += expf(sv - Ms[h]);
+            }
+        }
+        float * partial = partials + h*partial_stride;
+        partial[0] = Ms[h];
+        partial[1] = Ss[h];
+        memcpy(partial + 2, VKQ + h*DV, DV*sizeof(float));
+    }
+}
+
 static void ggml_compute_forward_flash_attn_ext_f16(
         const ggml_compute_params * params,
         ggml_tensor * dst) {
@@ -9428,7 +9717,14 @@ static void ggml_compute_forward_flash_attn_ext_f16(
         const int64_t partial_stride = nth * partial_size;
         float *       chunk_partials = partials_base + ith * partial_size;
 
-        if (ic_start < nek1) {
+        // heads sharing one KV head (MQA/GQA/MLA): one pass over the KV chunk for all heads
+        const bool grouped = (nek2 == 1 && nev2 == 1 && neq2 > 1 && nek3 == 1 && nev3 == 1);
+
+        if (ic_start < nek1 && grouped) {
+            float * scratch = partials_base + neq2 * partial_stride + ith * ggml_fa_decode_grouped_scratch(neq2, DK, DV);
+            ggml_compute_forward_flash_attn_ext_f16_decode_grouped(params, dst, ic_start, ic_end,
+                    chunk_partials, partial_stride, scratch);
+        } else if (ic_start < nek1) {
             for (int64_t q_head = 0; q_head < neq2; q_head++) {
                 ggml_compute_forward_flash_attn_ext_f16_one_chunk(
                     params, dst, q_head, q_head + 1, ic_start, ic_end,

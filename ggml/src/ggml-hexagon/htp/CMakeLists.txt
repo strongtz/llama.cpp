@@ -53,7 +53,6 @@ add_library(${HTP_LIB} SHARED
     allreduce-ops.c
     dsv4-hc-ops.c
     lightning-indexer-ops.c
-    v68-selftest.c
 )
 
 target_compile_definitions(${HTP_LIB} PRIVATE

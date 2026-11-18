@@ -107,3 +107,10 @@ struct ggml_fa_tile_config {
 };
 
 #endif
+
+// per-thread scratch (in floats) of the grouped single-query flash attention decode path
+static inline size_t ggml_fa_decode_grouped_scratch(int64_t H, int64_t DK, int64_t DV) {
+    // VKQ[H][DV] + M[H] + S[H] + Q[H][DK] (worst case f32 Q) + padding
+    return (size_t) (H*DV + 2*H + H*DK + 64);
+}
+

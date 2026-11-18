@@ -601,7 +601,6 @@ AEEResult htp_iface_start(remote_handle64 handle, uint32_t sess_id, uint64_t dsp
     }
 
     HAP_setFARFRuntimeLoggingParams(0xffff, NULL, 0);
-    { extern void htp_v68_selftest(void); htp_v68_selftest(); }
 
     // Set client class
     {
