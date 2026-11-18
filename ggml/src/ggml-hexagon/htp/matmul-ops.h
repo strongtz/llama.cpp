@@ -61,7 +61,7 @@ enum htp_mm_kernel_type {
 struct htp_mm_kernel_params {
     uint8_t  kernel_type;        // enum htp_mm_kernel_type
     uint8_t  pipeline;           // 1 = pipelined execution, 0 = standard
-    uint8_t  unused;             // reserved
+    uint8_t  unused;             // fused ADD_ID: bit p = output p has a bias input (after ids)
     uint8_t  n_hmx;              // 1 = use HMX, 0 = use HVX
 
     uint8_t  n_hvx;              // Number of threads to spawn
@@ -85,7 +85,14 @@ struct htp_mm_kernel_params {
     struct fastdiv_values div_ne12;
     struct fastdiv_values div_n_act_hvx;
     struct fastdiv_values div_ne00_padded;
+
+    // fused SWIGLU_OAI on a 2-weight MUL_MAT_ID_NX (unused bit 7): out = glu(o[glu_gate], o[1 - glu_gate])
+    uint8_t  glu_gate;
+    uint8_t  glu_pad[3];
+    float    glu_alpha;
+    float    glu_limit;
 };
+#define HTP_MM_FUSED_SWIGLU_OAI 0x80
 
 #if defined(__cplusplus)
 static_assert(sizeof(struct htp_mm_kernel_params) <= 128, "htp_matmul_kernel_params is too large for kernel_params blob");

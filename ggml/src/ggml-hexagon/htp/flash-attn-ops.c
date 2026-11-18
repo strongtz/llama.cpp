@@ -190,6 +190,7 @@ struct hmx_fa_context {
 };
 
 // Scan mask rows [q_start, q_start + n_rows_q) and build compact list of KV blocks with any entry != -inf.
+// The rows are streamed through the scratch buffer in chunks (a full Br x n_kv mask rarely fits).
 static uint32_t fa_scan_active_blocks(
         dma_queue *               dma_q,
         const struct htp_tensor * mask,
@@ -205,9 +206,9 @@ static uint32_t fa_scan_active_blocks(
         uint16_t *                active_blocks) {
     const size_t row_bytes  = (size_t) nek1 * sizeof(__fp16);
     const size_t row_stride = hex_round_up(row_bytes, 128);
+    const uint32_t rows_per_chunk = (uint32_t) (scratch_bytes / row_stride);
 
-    if (!mask || n_kv_blocks <= 1 || n_kv_blocks > FA_MAX_KV_BLOCKS ||
-        (size_t) n_rows_q * row_stride > scratch_bytes) {
+    if (!mask || n_kv_blocks <= 1 || n_kv_blocks > FA_MAX_KV_BLOCKS || rows_per_chunk == 0) {
         #pragma clang loop vectorize(disable)
         for (uint32_t b = 0; b < n_kv_blocks; ++b) {
             active_blocks[b] = (uint16_t) b;
@@ -215,31 +216,46 @@ static uint32_t fa_scan_active_blocks(
         return n_kv_blocks;
     }
 
-    const dma_addr_t m_src = mask->data + q_start * mask->nb[1] + im2 * mask->nb[2] + im3 * mask->nb[3];
-    dma_queue_push(dma_q, dma_make_data(vtcm_scratch, m_src), row_stride, mask->nb[1], row_bytes, n_rows_q);
-    const uint8_t * m_buf = (const uint8_t *) dma_queue_pop(dma_q).dst;
+    uint8_t is_active[FA_MAX_KV_BLOCKS];
+    memset(is_active, 0, n_kv_blocks);
+    uint32_t n_found = 0;
 
-    const HVX_Vector v_ninf   = Q6_Vh_vsplat_R(0xFC00);
-    uint32_t         n_active = 0;
+    const HVX_Vector v_ninf = Q6_Vh_vsplat_R(0xFC00);
 
-    for (uint32_t b = 0; b < n_kv_blocks; ++b) {
-        const uint32_t col0 = b * Bc;
-        const uint32_t cols = MIN(Bc, nek1 - col0);
+    for (uint32_t r0 = 0; r0 < n_rows_q && n_found < n_kv_blocks; r0 += rows_per_chunk) {
+        const uint32_t nr = MIN(rows_per_chunk, n_rows_q - r0);
+        const dma_addr_t m_src = mask->data + (q_start + r0) * mask->nb[1] + im2 * mask->nb[2] + im3 * mask->nb[3];
+        dma_queue_push(dma_q, dma_make_data(vtcm_scratch, m_src), row_stride, mask->nb[1], row_bytes, nr);
+        const uint8_t * m_buf = (const uint8_t *) dma_queue_pop(dma_q).dst;
+#ifdef FA_DEBUG_BLOCKS
+        if (q_start == 0 && r0 == 0 && nek1 >= 1024) {
+            const uint16_t * mr = (const uint16_t *) m_buf;
+            FARF(ALWAYS, "fa-dbg-mask: rpc %u row0 c0 %04x c1 %04x c500 %04x c1000 %04x row5 c500 %04x scratch %p bytes %zu",
+                 rows_per_chunk, mr[0], mr[1], mr[500], mr[1000], mr[5 * row_stride / 2 + 500], vtcm_scratch, scratch_bytes);
+        }
+#endif
 
-        for (uint32_t r = 0; r < n_rows_q; ++r) {
-            const __fp16 * row_ptr = (const __fp16 *) (m_buf + r * row_stride) + col0;
-            HVX_Vector v_any = Q6_V_vzero();
-            uint32_t c = 0;
-            for (; c + 64 <= cols; c += 64) {
-                const HVX_Vector v_m = *(const HVX_Vector *) (row_ptr + c);
-                v_any = Q6_V_vor_VV(v_any, Q6_V_vxor_VV(v_m, v_ninf));
+        for (uint32_t b = 0; b < n_kv_blocks; ++b) {
+            if (is_active[b]) {
+                continue;
             }
-            if (c < cols) {
-                const uint32_t rem = cols - c;
-                const HVX_VectorPred q_rem = Q6_Q_vsetq2_R(rem * sizeof(__fp16));
-                const HVX_Vector v_m = *(const HVX_Vector *) (row_ptr + c);
-                const HVX_Vector v_diff = Q6_V_vand_QV(q_rem, Q6_V_vxor_VV(v_m, v_ninf));
-                v_any = Q6_V_vor_VV(v_any, v_diff);
+            const uint32_t col0 = b * Bc;
+            const uint32_t cols = MIN(Bc, nek1 - col0);
+
+            HVX_Vector v_any = Q6_V_vzero();
+            for (uint32_t r = 0; r < nr; ++r) {
+                const __fp16 * row_ptr = (const __fp16 *) (m_buf + r * row_stride) + col0;
+                uint32_t c = 0;
+                for (; c + 64 <= cols; c += 64) {
+                    const HVX_Vector v_m = hvx_vmemu(row_ptr + c);
+                    v_any = Q6_V_vor_VV(v_any, Q6_V_vxor_VV(v_m, v_ninf));
+                }
+                if (c < cols) {
+                    const uint32_t rem = cols - c;
+                    const HVX_VectorPred q_rem = Q6_Q_vsetq2_R(rem * sizeof(__fp16));
+                    const HVX_Vector v_m = hvx_vmemu(row_ptr + c);
+                    v_any = Q6_V_vor_VV(v_any, Q6_V_vand_QV(q_rem, Q6_V_vxor_VV(v_m, v_ninf)));
+                }
             }
             v_any = Q6_V_vor_VV(v_any, Q6_V_vror_VR(v_any, 64));
             v_any = Q6_V_vor_VV(v_any, Q6_V_vror_VR(v_any, 32));
@@ -247,12 +263,18 @@ static uint32_t fa_scan_active_blocks(
             v_any = Q6_V_vor_VV(v_any, Q6_V_vror_VR(v_any, 8));
             v_any = Q6_V_vor_VV(v_any, Q6_V_vror_VR(v_any, 4));
             if (Q6_R_vextract_VR(v_any, 0) != 0) {
-                active_blocks[n_active++] = (uint16_t) b;
-                break;
+                is_active[b] = 1;
+                ++n_found;
             }
         }
     }
 
+    uint32_t n_active = 0;
+    for (uint32_t b = 0; b < n_kv_blocks; ++b) {
+        if (is_active[b]) {
+            active_blocks[n_active++] = (uint16_t) b;
+        }
+    }
     if (n_active == 0 && n_kv_blocks > 0) {
         active_blocks[0] = 0;
         n_active = 1;
@@ -2267,6 +2289,12 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
                     active_blocks[b] = (uint16_t) b;
                 }
             }
+#ifdef FA_DEBUG_BLOCKS
+            if (q_start == q_start_min || q_start + Br >= q_start_max) {
+                FARF(ALWAYS, "fa-dbg: neq1 %u nek1 %u G %u Br %u Bc %u g_br %u nkvb %u active %u q_start %u bcast %d pipe %d mask %p",
+                     neq1, nek1, G, Br, Bc, g_br, factx.n_kv_blocks, n_active_blocks, q_start, (int) factx.mask_broadcast, (int) pipeline, (void *) mask);
+            }
+#endif
             const uint32_t b0       = (n_active_blocks > 0) ? active_blocks[0] : 0;
             const uint32_t b0_start = b0 * Bc;
             const uint32_t b0_rows  = hex_smin(Bc, nek1 - b0_start);

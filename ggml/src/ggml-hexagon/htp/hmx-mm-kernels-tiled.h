@@ -2096,6 +2096,89 @@ static void transfer_activation_chunk_fp32_to_fp16_gathered_flat(
     }
 }
 
+// fused MoE gate/up epilogue, split over the two jobs of a chunk so both epilogues cost about the same:
+//   phase 0 (first job):  h = gate-half or up-half of tile0 (+ bias), kept in VTCM (f32, hbuf_stride floats per row)
+//   phase 1 (second job): out = h * other-half(tile1 + bias), scattered to the routed rows
+//   gate-half(x) = min(x, limit) * sigmoid(alpha * min(x, limit)),  up-half(y) = clamp(y, -limit, limit) + 1
+static inline HVX_Vector moe_glu_half(HVX_Vector v, int is_gate, HVX_Vector v_alpha, HVX_Vector v_lim, HVX_Vector v_nlim,
+                                      HVX_Vector one, HVX_Vector max_exp, HVX_Vector min_exp) {
+    if (is_gate) {
+        v = Q6_Vsf_vmin_VsfVsf(v, v_lim);
+        return hvx_vec_mul_f32_f32(v, hvx_vec_fast_sigmoid_f32_guard(hvx_vec_mul_f32_f32(v, v_alpha), one, max_exp, min_exp));
+    }
+    v = Q6_Vsf_vmax_VsfVsf(Q6_Vsf_vmin_VsfVsf(v, v_lim), v_nlim);
+    return hvx_vec_add_f32_f32(v, one);
+}
+
+static void transfer_output_swiglu_oai_phase(
+            int phase,
+            int is_gate,                    // role of this job's tile
+            float *restrict dst,            // phase 1
+            float *restrict hbuf,           // VTCM, phase 0 writes / phase 1 reads
+            uint32_t hbuf_stride,
+            const __fp16 *restrict src,
+            const float *restrict bias,
+            uint32_t start_row,
+            uint32_t vtcm_start_row,
+            uint32_t n_rows,
+            uint32_t n_cols,
+            const struct mmid_row_mapping *matrix_rows,
+            uint32_t cur_a,
+            uint32_t mapping_stride,
+            size_t dst_nb1,
+            size_t dst_nb2,
+            uint32_t cne1,
+            float alpha,
+            float limit) {
+    const size_t tile_row_stride = (n_cols / HTP_MM_HMX_TILE_N_COLS) * HTP_MM_HMX_TILE_N_ELMS;
+    const HVX_Vector one_h   = hvx_vec_splat_f16(1.0);
+    const HVX_Vector one     = hvx_vec_splat_f32(1.0f);
+    const HVX_Vector v_alpha = hvx_vec_splat_f32(alpha);
+    const HVX_Vector v_lim   = hvx_vec_splat_f32(limit);
+    const HVX_Vector v_nlim  = hvx_vec_splat_f32(-limit);
+    const HVX_Vector max_exp = hvx_vec_splat_f32(87.f);
+    const HVX_Vector min_exp = hvx_vec_splat_f32(-87.f);
+    const HVX_Vector zero    = Q6_V_vzero();
+
+    for (size_t r = 0; r < n_rows; r += 2) {
+        const uint32_t r_idx0 = start_row + r + 0;
+        const uint32_t r_idx1 = start_row + r + 1;
+        const uint32_t lr = vtcm_start_row + r;
+        const size_t r0 = lr / HTP_MM_HMX_TILE_N_ROWS;
+        const size_t r1 = (lr % HTP_MM_HMX_TILE_N_ROWS) / 2;
+        if (r_idx0 >= cne1) break;
+        const bool has1 = r_idx1 < cne1;
+        float * h0 = hbuf + (size_t) lr * hbuf_stride;
+        float * h1 = h0 + hbuf_stride;
+        float * out0 = NULL, * out1 = NULL;
+        if (phase) {
+            const struct mmid_row_mapping m0 = matrix_rows[cur_a * mapping_stride + r_idx0];
+            out0 = (float *) ((uint8_t *) dst + m0.i1 * dst_nb1 + m0.i2 * dst_nb2);
+            if (has1) {
+                const struct mmid_row_mapping m1 = matrix_rows[cur_a * mapping_stride + r_idx1];
+                out1 = (float *) ((uint8_t *) dst + m1.i1 * dst_nb1 + m1.i2 * dst_nb2);
+            }
+        }
+        const __fp16 * rb = src + r0 * tile_row_stride;
+        for (size_t c = 0; c < (size_t) n_cols; c += HTP_MM_HMX_TILE_N_COLS) {
+            const size_t t = (c / HTP_MM_HMX_TILE_N_COLS) * HTP_MM_HMX_TILE_N_ELMS;
+            const HVX_VectorPair vp = Q6_Wqf32_vmpy_VhfVhf(((const HVX_Vector *) (rb + t))[r1], one_h);
+            const HVX_Vector vb = bias ? hvx_vmemu(bias + c) : zero;
+            HVX_Vector a0 = moe_glu_half(Q6_Vsf_equals_Vqf32(Q6_Vqf32_vadd_Vqf32Vsf(Q6_V_lo_W(vp), vb)), is_gate, v_alpha, v_lim, v_nlim, one, max_exp, min_exp);
+            HVX_Vector a1 = moe_glu_half(Q6_Vsf_equals_Vqf32(Q6_Vqf32_vadd_Vqf32Vsf(Q6_V_hi_W(vp), vb)), is_gate, v_alpha, v_lim, v_nlim, one, max_exp, min_exp);
+            if (!phase) {
+                *(HVX_Vector *) (h0 + c) = a0;
+                *(HVX_Vector *) (h1 + c) = a1;
+            } else {
+                hvx_vmemu(out0 + c) = hvx_vec_mul_f32_f32(a0, *(const HVX_Vector *) (h0 + c));
+                if (out1) {
+                    hvx_vmemu(out1 + c) = hvx_vec_mul_f32_f32(a1, *(const HVX_Vector *) (h1 + c));
+                }
+            }
+        }
+    }
+}
+
 static void transfer_output_chunk_fp16_to_fp32_scattered(
             float *restrict dst,
             const __fp16 *restrict vtcm_src,
@@ -2108,11 +2191,41 @@ static void transfer_output_chunk_fp16_to_fp32_scattered(
             uint32_t mapping_stride,
             size_t dst_nb1,
             size_t dst_nb2,
-            uint32_t cne1) {
+            uint32_t cne1,
+            const float *restrict bias) {   // optional: bias[c] added to every row (fused ADD_ID)
     assert(n_cols % HTP_MM_HMX_TILE_N_COLS == 0);
     const size_t tile_row_stride = (n_cols / HTP_MM_HMX_TILE_N_COLS) * HTP_MM_HMX_TILE_N_ELMS;
 
     const HVX_Vector one = hvx_vec_splat_f16(1.0);
+    if (bias) {
+        for (size_t r = 0; r < n_rows; r += 2) {
+            uint32_t r_idx0 = start_row + r + 0;
+            uint32_t r_idx1 = start_row + r + 1;
+            uint32_t     lr = vtcm_start_row + r;
+            const size_t r0 = (lr / HTP_MM_HMX_TILE_N_ROWS);
+            const size_t r1 = (lr % HTP_MM_HMX_TILE_N_ROWS) / 2;
+            const __fp16 *row_base = vtcm_src + r0 * tile_row_stride;
+            if (r_idx0 >= cne1) break;
+            struct mmid_row_mapping mapping0 = matrix_rows[cur_a * mapping_stride + r_idx0];
+            float *output_row0 = (float *) ((uint8_t *) dst + mapping0.i1 * dst_nb1 + mapping0.i2 * dst_nb2);
+            float *output_row1 = NULL;
+            if (r_idx1 < cne1) {
+                struct mmid_row_mapping mapping1 = matrix_rows[cur_a * mapping_stride + r_idx1];
+                output_row1 = (float *) ((uint8_t *) dst + mapping1.i1 * dst_nb1 + mapping1.i2 * dst_nb2);
+            }
+            for (size_t c = 0; c < (size_t) n_cols; c += HTP_MM_HMX_TILE_N_COLS) {
+                const __fp16 *tile = row_base + (c / HTP_MM_HMX_TILE_N_COLS) * HTP_MM_HMX_TILE_N_ELMS;
+                HVX_Vector v = ((const HVX_Vector *) tile)[r1];
+                HVX_VectorPair vp = Q6_Wqf32_vmpy_VhfVhf(v, one);
+                const HVX_Vector vb = hvx_vmemu(bias + c);
+                hvx_vmemu(output_row0 + c) = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vadd_Vqf32Vsf(Q6_V_lo_W(vp), vb));
+                if (output_row1) {
+                    hvx_vmemu(output_row1 + c) = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vadd_Vqf32Vsf(Q6_V_hi_W(vp), vb));
+                }
+            }
+        }
+        return;
+    }
 
     for (size_t r = 0; r < n_rows; r += 2) {
         uint32_t r_idx0 = start_row + r + 0;

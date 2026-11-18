@@ -186,8 +186,28 @@ static __attribute__((noinline)) void rope_cache_init(const float    theta_base,
             theta *= theta_scale;
         }
     } else {
-        float theta = theta_base;
-        for (uint32_t i0 = 0; i0 < n_cache; i0 += 2) {
+        // YaRN: theta_final = theta * (freq_scale * (1 - ramp_mix) + ramp_mix), ramp_mix depends on i0 only
+        const uint32_t n_blocks = n_cache / 64;
+
+        HVX_Vector v_theta_powers = hvx_vmemu(theta_powers);
+        const float mscale_final = mscale * (1.0f + 0.1f * logf(1.0f / freq_scale));
+        HVX_Vector v_mscale = hvx_vec_splat_f32(mscale_final);
+        float coef[32] __attribute__((aligned(128)));
+
+        float theta_block = theta_base;
+        for (uint32_t b = 0; b < n_blocks; b++) {
+            const uint32_t i0 = b * 64;
+            for (uint32_t k = 0; k < 32; ++k) {
+                const float ramp_mix = rope_yarn_ramp(corr_dims[0], corr_dims[1], (int) (i0 + 2 * k)) * ext_factor;
+                coef[k] = freq_scale * (1.0f - ramp_mix) + ramp_mix;
+            }
+            HVX_Vector v_theta = hvx_vec_mul_f32_f32(hvx_vec_splat_f32(theta_block), v_theta_powers);
+            rope_cache_hvx_32(cache, i0, v_theta, freq_factors, hvx_vmem(coef), v_mscale);
+            theta_block *= theta_scale_32;
+        }
+
+        float theta = theta_block;
+        for (uint32_t i0 = n_blocks * 64; i0 < n_cache; i0 += 2) {
             const float ff = freq_factors ? freq_factors[i0 / 2] : 1.0f;
             rope_yarn_one(theta / ff, freq_scale, corr_dims, i0, ext_factor, mscale, cache);
             theta *= theta_scale;

@@ -17,6 +17,7 @@
 #include "hvx-arith.h"
 #include "hvx-reduce.h"
 #include "hvx-copy.h"
+#include "hvx-sigmoid.h"
 
 #define GGML_COMMON_DECL_C
 #include "ggml-common.h"
@@ -73,6 +74,7 @@ static bool htp_matmul_has_extended_weight(const struct htp_ops_context * octx, 
 }
 
 struct htp_mm_context {
+    int bias_done;   // fused ADD_ID bias already applied by the HMX MoE pipeline
     const char * type;
     struct htp_ops_context * octx;
     const struct htp_tensor * act;
@@ -2286,6 +2288,7 @@ typedef struct {
     size_t                          dst_nb2;
     uint32_t                        start_row;
     uint32_t                        cne1;
+    const float                   * bias;
 } output_transfer_scattered_task_state_t;
 
 static void transfer_activation_chunk_gathered_worker_fn(const htp_thread_t * th, unsigned int n, unsigned int i, void *data) {
@@ -2326,6 +2329,35 @@ static void transfer_activation_chunk_gathered_worker_flat_fn(const htp_thread_t
     }
 }
 
+typedef struct {
+    const struct mmid_row_mapping * matrix_rows;
+    const __fp16 * src;
+    const float  * bias;
+    float        * dst;
+    float        * hbuf;
+    uint32_t hbuf_stride;
+    int      phase, is_gate;
+    uint32_t n_tot_chunks, n_chunks_per_task, n_cols, cur_a, mapping_stride, start_row, cne1;
+    size_t   dst_nb1, dst_nb2;
+    float    alpha, limit;
+} output_swiglu_scattered_task_state_t;
+
+static void transfer_output_swiglu_worker_fn(const htp_thread_t * th, unsigned int n, unsigned int i, void * data) {
+    (void) n;
+    output_swiglu_scattered_task_state_t * st = data;
+    struct htp_thread_trace * tr = th->trace;
+    const int vtcm_start_row = i * st->n_chunks_per_task;
+    const int start_row      = st->start_row + vtcm_start_row;
+    int n_rows = (int) st->n_tot_chunks - vtcm_start_row;
+    if (n_rows > (int) st->n_chunks_per_task) n_rows = st->n_chunks_per_task;
+    if (n_rows <= 0) return;
+    htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_O_PROC, i);
+    transfer_output_swiglu_oai_phase(st->phase, st->is_gate, st->dst, st->hbuf, st->hbuf_stride, st->src, st->bias,
+        start_row, vtcm_start_row, n_rows, st->n_cols, st->matrix_rows, st->cur_a, st->mapping_stride,
+        st->dst_nb1, st->dst_nb2, st->cne1, st->alpha, st->limit);
+    htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_O_PROC, i);
+}
+
 static void transfer_output_chunk_scattered_worker_fn(const htp_thread_t * th, unsigned int n, unsigned int i, void *data) {
     output_transfer_scattered_task_state_t *st = data;
     struct htp_thread_trace * tr = th->trace;
@@ -2339,7 +2371,7 @@ static void transfer_output_chunk_scattered_worker_fn(const htp_thread_t * th, u
         transfer_output_chunk_fp16_to_fp32_scattered(
             st->dst, st->vtcm_src, start_row, vtcm_start_row, n_rows, st->n_cols,
             st->matrix_rows, st->cur_a, st->mapping_stride,
-            st->dst_nb1, st->dst_nb2, st->cne1);
+            st->dst_nb1, st->dst_nb2, st->cne1, st->bias);
         htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_O_PROC, chunk_idx);
     }
 }
@@ -3535,7 +3567,8 @@ static void transfer_output_chunk_scattered_threaded(
             size_t dst_nb1,
             size_t dst_nb2,
             int cne1,
-            int n_hvx) {
+            int n_hvx,
+            const float * bias) {
     if (n_rows <= 0) return;
     int chunks_per_hvx = hmx_ceil_div(n_rows, n_hvx);
     chunks_per_hvx = hex_align_up(chunks_per_hvx, 2);
@@ -3543,6 +3576,7 @@ static void transfer_output_chunk_scattered_threaded(
     int actual_hvx = hmx_ceil_div(n_rows, chunks_per_hvx);
 
     output_transfer_scattered_task_state_t state = {
+        .bias              = bias,
         .vtcm_src          = vtcm_src,
         .dst               = dst,
         .n_tasks           = actual_hvx,
@@ -3712,7 +3746,7 @@ static int hmx_mm_id_2d_f32(struct htp_context *ctx,
             // D: Output Store
             transfer_output_chunk_scattered_threaded(
                 ctx, dst + nc, vtcm_output, (int) mr, (int) n_rows, (int) n_cols,
-                matrix_rows, cur_a, mapping_stride, dst_nb1, dst_nb2, cne1, n_hvx);
+                matrix_rows, cur_a, mapping_stride, dst_nb1, dst_nb2, cne1, n_hvx, NULL);
         }
     }
 
@@ -3890,6 +3924,8 @@ struct hmx_moe_weight {
     size_t     nb2;       // expert stride (XQ4: d stride)
     dma_addr_t qdata;     // XQ4 only: q of expert 0
     size_t     qnb2;      // XQ4 only: q stride
+    const float * bias;   // optional fused ADD_ID bias [n_expert][n] (row stride bias_nb1)
+    size_t     bias_nb1;
     float    * dst;
     size_t     dst_nb1;
     size_t     dst_nb2;
@@ -3904,13 +3940,21 @@ struct hmx_moe_job {
     int n_cols;
 };
 
-static inline bool hmx_moe_next(struct hmx_moe_job * j, const uint32_t * counts, int n_as, int n_w, int n, int M, int NC) {
+static inline bool hmx_moe_next(struct hmx_moe_job * j, const uint32_t * counts, int n_as, int n_w, int n, int M, int NC, int p_inner) {
     if (j->a >= 0) {
-        j->nc += NC;
-        if (j->nc < n) goto fill;
-        j->nc = 0;
-        if (++j->p < n_w) goto fill;
-        j->p = 0;
+        if (p_inner) {
+            if (++j->p < n_w) goto fill;
+            j->p = 0;
+            j->nc += NC;
+            if (j->nc < n) goto fill;
+            j->nc = 0;
+        } else {
+            j->nc += NC;
+            if (j->nc < n) goto fill;
+            j->nc = 0;
+            if (++j->p < n_w) goto fill;
+            j->p = 0;
+        }
         j->mr += M;
         if (j->mr < (int) counts[j->a]) goto fill;
     }
@@ -4061,6 +4105,34 @@ static void hmx_moe_stage_cvt_worker(const htp_thread_t * th, unsigned int n, un
     htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_A_PREP, ith);
 }
 
+#define MOE_BIAS_PTR(W, A, NC) ((W)->bias ? (const float *) ((const uint8_t *) (W)->bias + (size_t) (A) * (W)->bias_nb1) + (NC) : NULL)
+#define MOE_SCATTER_PREV() do { \
+        if (!glu) { \
+            const struct hmx_moe_weight * w = &ws[prev.p]; \
+            transfer_output_chunk_scattered_threaded( \
+                ctx, w->dst + prev.nc, obuf[(j + 1) & 1], prev.mr, hex_align_up(prev.n_rows, 32), prev.n_cols, \
+                matrix_rows, prev.a, mapping_stride, w->dst_nb1, w->dst_nb2, (int) counts[prev.a], n_hvx, \
+                MOE_BIAS_PTR(w, prev.a, prev.nc)); \
+        } else { \
+            const int gi = glu_kp->glu_gate; \
+            const struct hmx_moe_weight * wp = &ws[prev.p]; \
+            output_swiglu_scattered_task_state_t gst; \
+            const int nr_ = hex_align_up(prev.n_rows, 32); \
+            int cph_ = hex_align_up(hmx_ceil_div(nr_, n_hvx), 2); \
+            gst.matrix_rows = matrix_rows; \
+            gst.src = obuf[(j + 1) & 1]; \
+            gst.bias = MOE_BIAS_PTR(wp, prev.a, prev.nc); \
+            gst.dst = ws[gi].dst + prev.nc; \
+            gst.hbuf = hbuf; gst.hbuf_stride = hbuf_stride; \
+            gst.phase = prev.p; gst.is_gate = (prev.p == gi); \
+            gst.n_tot_chunks = nr_; gst.n_chunks_per_task = cph_; gst.n_cols = prev.n_cols; \
+            gst.cur_a = prev.a; gst.mapping_stride = mapping_stride; gst.start_row = prev.mr; \
+            gst.cne1 = counts[prev.a]; gst.dst_nb1 = ws[gi].dst_nb1; gst.dst_nb2 = ws[gi].dst_nb2; \
+            gst.alpha = glu_kp->glu_alpha; gst.limit = glu_kp->glu_limit; \
+            work_queue_run(ctx->hvx_queue, transfer_output_swiglu_worker_fn, &gst, hmx_ceil_div(nr_, cph_)); \
+        } \
+    } while (0)
+
 static int hmx_mm_id_pipelined(struct htp_context * ctx,
                                dma_queue * dma,
                                const struct hmx_moe_weight * ws,
@@ -4072,9 +4144,12 @@ static int hmx_mm_id_pipelined(struct htp_context * ctx,
                                int tile_size, int aligned_tile_size,
                                const uint32_t * counts,
                                const struct mmid_row_mapping * matrix_rows,
-                               int mapping_stride, int n_as, int n_hvx) {
+                               int mapping_stride, int n_as, int n_hvx,
+                               const struct htp_mm_kernel_params * glu_kp) {
     struct htp_thread_trace * tr = &ctx->trace[0];
     htp_trace_event_start(tr, HTP_TRACE_EVT_INIT, 1);
+    // fused SWIGLU_OAI: gate/up jobs of the same chunk run back to back, the up job's epilogue combines both
+    const int glu = (glu_kp && (glu_kp->unused & HTP_MM_FUSED_SWIGLU_OAI) && n_w == 2) ? 1 : 0;
 
     if (k % 32 != 0 || n % 32 != 0 || tile_size <= 0) return -1;
     if (!hex_is_aligned(act, VLEN)) return -1;
@@ -4119,7 +4194,8 @@ static int hmx_mm_id_pipelined(struct htp_context * ctx,
             const size_t w_  = hex_align_up((size_t) nc * w_per_col, HTP_MM_HMX_TILE_SIZE);
             const size_t a_  = hex_align_up((size_t) m_try * w_per_col, HTP_MM_HMX_TILE_SIZE);
             const size_t o_  = hex_align_up((size_t) m_try * nc * sizeof(__fp16), HTP_MM_HMX_TILE_SIZE);
-            if (3 * r_ + 2 * (w_ + a_ + o_) + 256 > budget) continue;
+            const size_t h_ = glu ? hex_align_up((size_t) m_try * nc * sizeof(float), HTP_MM_HMX_TILE_SIZE) : 0;
+            if (3 * r_ + 2 * (w_ + a_ + o_) + h_ + 256 > budget) continue;
             // cost in dequantized weights: one dequant of the full weight per (expert, m-chunk)
             // plus a fixed per-job overhead (thread dispatch, small HMX jobs)
             uint64_t n_mchunks = 0;
@@ -4140,11 +4216,15 @@ static int hmx_mm_id_pipelined(struct htp_context * ctx,
     const size_t o_sz   = hex_align_up((size_t) M * NC * sizeof(__fp16), HTP_MM_HMX_TILE_SIZE);
 
     uint8_t * vp = (uint8_t *) ctx->vtcm_base;
-    __fp16 * wbuf[2], * abuf[2], * obuf[2];
+    __fp16 * wbuf[2], * abuf[2], * obuf[3];
+    float * hbuf = NULL;
+    const uint32_t hbuf_stride = NC;
     void   * raw[3];
     for (int i = 0; i < 2; ++i) wbuf[i] = (__fp16 *) vtcm_seq_alloc(&vp, w_sz);
     for (int i = 0; i < 2; ++i) abuf[i] = (__fp16 *) vtcm_seq_alloc(&vp, a_sz);
     for (int i = 0; i < 2; ++i) obuf[i] = (__fp16 *) vtcm_seq_alloc(&vp, o_sz);
+    obuf[2] = obuf[0];
+    if (glu) hbuf = (float *) vtcm_seq_alloc(&vp, hex_align_up((size_t) M * NC * sizeof(float), HTP_MM_HMX_TILE_SIZE));
     for (int i = 0; i < 3; ++i) raw[i]  = vtcm_seq_alloc(&vp, raw_sz);
     __fp16 * scales = (__fp16 *) vtcm_seq_alloc(&vp, 256);
     if ((size_t) (vp - (uint8_t *) ctx->vtcm_base) > budget) return -1;
@@ -4157,7 +4237,7 @@ static int hmx_mm_id_pipelined(struct htp_context * ctx,
     htp_trace_event_stop(tr, HTP_TRACE_EVT_INIT, 1);
 
     struct hmx_moe_job cur = { .a = -1 };
-    if (!hmx_moe_next(&cur, counts, n_as, n_w, n, M, NC)) return 0;
+    if (!hmx_moe_next(&cur, counts, n_as, n_w, n, M, NC, glu)) return 0;
 
     // all DMA (weights + staged activation rows) goes through one queue: descriptor chains are
     // per hardware thread. Completion is in order, waits are by sequence number.
@@ -4182,7 +4262,7 @@ static int hmx_mm_id_pipelined(struct htp_context * ctx,
     MOE_PUSH_DMA(cur, 0);
     // DMA runs two jobs ahead
     struct hmx_moe_job ahead = cur;
-    bool has_ahead = hmx_moe_next(&ahead, counts, n_as, n_w, n, M, NC);
+    bool has_ahead = hmx_moe_next(&ahead, counts, n_as, n_w, n, M, NC, glu);
     if (has_ahead) {
         MOE_PUSH_DMA(ahead, 1);
     }
@@ -4221,7 +4301,7 @@ static int hmx_mm_id_pipelined(struct htp_context * ctx,
     int j = 0;
     while (cur.a >= 0) {
         struct hmx_moe_job nxt = cur;
-        const bool has_next = hmx_moe_next(&nxt, counts, n_as, n_w, n, M, NC);
+        const bool has_next = hmx_moe_next(&nxt, counts, n_as, n_w, n, M, NC, glu);
 
         // new (expert, m-chunk): gather activations into the other buffer
         if (cur.p == 0 && cur.nc == 0) {
@@ -4266,7 +4346,7 @@ static int hmx_mm_id_pipelined(struct htp_context * ctx,
         void * cur_raw = raw[j % 3];
         t1 = hex_get_cycles(); tdma += t1 - t0;
         if (has_ahead) {
-            has_ahead = hmx_moe_next(&ahead, counts, n_as, n_w, n, M, NC);
+            has_ahead = hmx_moe_next(&ahead, counts, n_as, n_w, n, M, NC, glu);
             if (has_ahead) {
                 MOE_PUSH_DMA(ahead, (j + 2) % 3);
             }
@@ -4288,10 +4368,7 @@ static int hmx_mm_id_pipelined(struct htp_context * ctx,
         hmx_queue_push(ctx->hmx_queue, hmx_queue_make_desc(hmx_matmul_worker_fn, &hjob[j & 1]));
 
         if (prev.a >= 0) {
-            const struct hmx_moe_weight * w = &ws[prev.p];
-            transfer_output_chunk_scattered_threaded(
-                ctx, w->dst + prev.nc, obuf[(j + 1) & 1], prev.mr, hex_align_up(prev.n_rows, 32), prev.n_cols,
-                matrix_rows, prev.a, mapping_stride, w->dst_nb1, w->dst_nb2, (int) counts[prev.a], n_hvx);
+            MOE_SCATTER_PREV();
         }
         tsc += hex_get_cycles() - t1;
 
@@ -4304,12 +4381,11 @@ static int hmx_mm_id_pipelined(struct htp_context * ctx,
     hmx_queue_pop(ctx->hmx_queue);
     while (dma_popped < dma_pushed) { dma_queue_pop(dma); ++dma_popped; }
     {
-        const struct hmx_moe_weight * w = &ws[prev.p];
-        transfer_output_chunk_scattered_threaded(
-            ctx, w->dst + prev.nc, obuf[(j + 1) & 1], prev.mr, hex_align_up(prev.n_rows, 32), prev.n_cols,
-            matrix_rows, prev.a, mapping_stride, w->dst_nb1, w->dst_nb2, (int) counts[prev.a], n_hvx);
+        MOE_SCATTER_PREV();
     }
 #undef MOE_PUSH_DMA
+#undef MOE_SCATTER_PREV
+#undef MOE_BIAS_PTR
 #undef MOE_DMA_WAIT
 #if HMX_MOE_PROF
     FARF(ALWAYS, "moe-prof: nw %d M %d NC %d jobs %d push %u stagewait %u gather %u dma %u dequant %u hmxwait %u scatter %u", n_w, M, NC, j, (unsigned) (tpush >> 10), (unsigned) (tsw >> 10),
@@ -4318,6 +4394,27 @@ static int hmx_mm_id_pipelined(struct htp_context * ctx,
     (void) tpush; (void) tsw; (void) tg; (void) tdma; (void) tdq; (void) thmx; (void) tsc;
 #endif
     return 0;
+}
+
+// fused ADD_ID fallback: dst rows of each expert += bias[expert]
+static void htp_mmid_bias_postpass(float * dst, size_t dst_nb1, size_t dst_nb2, uint32_t n,
+                                   const float * bias, size_t bias_nb1,
+                                   const uint32_t * counts, const struct mmid_row_mapping * matrix_rows,
+                                   uint32_t mapping_stride, uint32_t n_as) {
+    for (uint32_t a = 0; a < n_as; ++a) {
+        const float * b = (const float *) ((const uint8_t *) bias + (size_t) a * bias_nb1);
+        for (uint32_t r = 0; r < counts[a]; ++r) {
+            const struct mmid_row_mapping m = matrix_rows[a * mapping_stride + r];
+            float * row = (float *) ((uint8_t *) dst + m.i1 * dst_nb1 + m.i2 * dst_nb2);
+            uint32_t c = 0;
+            for (; c + 32 <= n; c += 32) {
+                hvx_vmemu(row + c) = hvx_vec_add_f32_f32(hvx_vmemu(row + c), hvx_vmemu(b + c));
+            }
+            for (; c < n; ++c) {
+                row[c] += b[c];
+            }
+        }
+    }
 }
 
 static int hmx_mm_op_matmul_id(
@@ -4345,7 +4442,11 @@ static int hmx_mm_op_matmul_id(
 
     if (octx->ctx->mdev.count <= 1 && hmx_moe_pipeline_enabled()) {
         const int wt = htp_tensor_mm_wtype(src0);
-        struct hmx_moe_weight w = { src0->data, nb02, 0, 0, (float *) dst->data, nb1, nb2 };
+        struct hmx_moe_weight w = { src0->data, nb02, 0, 0, NULL, 0, (float *) dst->data, nb1, nb2 };
+        if (kparams->unused & 1) {
+            w.bias     = (const float *) (uintptr_t) octx->src[3]->data;
+            w.bias_nb1 = octx->src[3]->nb[1];
+        }
         if (wt == HTP_TYPE_XQ4_0) {
             w.nb2   = (size_t) ne01 * (ne00 / 32) * 2;
             w.qdata = htp_mm_xq4_qbase(src0->data, ne02, ne01, ne00);
@@ -4354,7 +4455,8 @@ static int hmx_mm_op_matmul_id(
         if (hmx_mm_id_pipelined(octx->ctx, octx->ctx->dma[0], &w, 1, (const float *) act->data,
                                 ne00, ne01, ne10, ne11, nb11, nb12, (int) src0->nb[1], wt,
                                 kparams->tile_size, kparams->aligned_tile_size,
-                                matrix_row_counts, matrix_rows, mmctx->mapping_stride, n_as, (int) octx->n_hvx) == 0) {
+                                matrix_row_counts, matrix_rows, mmctx->mapping_stride, n_as, (int) octx->n_hvx, NULL) == 0) {
+            mmctx->bias_done = 1;
             return HTP_STATUS_OK;
         }
     }
@@ -4535,6 +4637,13 @@ static int hmx_mm_op_matmul_id_nx(
             ws[p].nb2     = src_w->nb[2];
             ws[p].qdata   = 0;
             ws[p].qnb2    = 0;
+            ws[p].bias    = NULL;
+            ws[p].bias_nb1 = 0;
+            if (kparams->unused & (1u << p)) {
+                const struct htp_tensor * b = octx->src[n_weights + 2 + __builtin_popcount(kparams->unused & 0x0f & ((1u << p) - 1))];
+                ws[p].bias     = (const float *) (uintptr_t) b->data;
+                ws[p].bias_nb1 = b->nb[1];
+            }
             if (htp_tensor_is_xq4(src_w)) {
                 ws[p].nb2   = (size_t) src_w->ne[1] * (src_w->ne[0] / 32) * 2;
                 ws[p].qdata = htp_mm_xq4_qbase(src_w->data, src_w->ne[2], src_w->ne[1], src_w->ne[0]);
@@ -4548,9 +4657,15 @@ static int hmx_mm_op_matmul_id_nx(
                                         src0->ne[0], src0->ne[1], act->ne[0], act->ne[1], act->nb[1], act->nb[2],
                                         (int) src0->nb[1], htp_tensor_mm_wtype(src0),
                                         kparams->tile_size, kparams->aligned_tile_size,
-                                        matrix_row_counts, matrix_rows, mmctx->mapping_stride, n_as, (int) octx->n_hvx) == 0) {
+                                        matrix_row_counts, matrix_rows, mmctx->mapping_stride, n_as, (int) octx->n_hvx, kparams) == 0) {
+            mmctx->bias_done = 1;
             return HTP_STATUS_OK;
         }
+    }
+
+    if (kparams->unused & HTP_MM_FUSED_SWIGLU_OAI) {
+        FARF(ERROR, "MUL_MAT_ID_NX: fused SWIGLU_OAI needs the pipelined HMX kernel");
+        return HTP_STATUS_NO_SUPPORT;
     }
 
     uint32_t target_dev = 0;
@@ -4972,6 +5087,11 @@ int op_matmul_id(struct htp_ops_context * octx) {
             s = HTP_STATUS_NO_SUPPORT;
         }
     }
+    if (s == HTP_STATUS_OK && (kparams->unused & 1) && !mmctx->bias_done && octx->ctx->mdev.count <= 1) {
+        htp_mmid_bias_postpass((float *) dst->data, dst->nb[1], dst->nb[2], dst->ne[0],
+                               (const float *) (uintptr_t) octx->src[3]->data, octx->src[3]->nb[1],
+                               matrix_row_counts, matrix_rows, mapping_stride, n_as);
+    }
 
     if (mapping_buf != octx->ctx->ddr_spad_base) {
         free(mapping_buf);
@@ -5058,6 +5178,17 @@ int op_matmul_id_nx(struct htp_ops_context * octx) {
             s = hvx_mm_matmul_id_nx(octx, mmctx, act_nrows > 1 ? hvx_mm_id_nx_tiled : hvx_mv_id_nx_tiled);
         } else {
             s = HTP_STATUS_NO_SUPPORT;
+        }
+    }
+    if (s == HTP_STATUS_OK && (kparams->unused & 0x0f) && !mmctx->bias_done && octx->ctx->mdev.count <= 1) {
+        const uint32_t nw = kparams->n_weights;
+        for (uint32_t p = 0, bi = 0; p < nw; ++p) {
+            if (!(kparams->unused & (1u << p))) continue;
+            const struct htp_tensor * b = octx->src[nw + 2 + bi++];
+            const struct htp_tensor * d = octx->dsts[p];
+            htp_mmid_bias_postpass((float *) d->data, d->nb[1], d->nb[2], d->ne[0],
+                                   (const float *) (uintptr_t) b->data, b->nb[1],
+                                   matrix_row_counts, matrix_rows, mapping_stride, n_as);
         }
     }
 

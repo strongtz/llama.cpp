@@ -333,7 +333,8 @@ static inline int hmx_fa_find_chunk_size(size_t * Br_out,
                                          bool     is_q_fp32,
                                          bool     has_sinks,
                                          size_t   n_heads,
-                                         size_t   q_split) {
+                                         size_t   q_split,
+                                         size_t   bc_cap) {
     const size_t T       = HMX_FP16_TILE_N_ROWS;  // 32
     const size_t br_unit = hmx_ceil_div(T, gqa_factor);
     const size_t bc_unit = HMX_FP16_TILE_N_COLS * 2;  // 64
@@ -349,6 +350,9 @@ static inline int hmx_fa_find_chunk_size(size_t * Br_out,
     // For small-Q SWA-sized KV caches (qo_len <= 16, kv_len <= 2048), cap Bc at 256 for block-skipping granularity
     if (qo_len <= 16 && kv_len <= 2048 && Bc_limit > 256) {
         Bc_limit = 256;
+    }
+    if (bc_cap >= bc_unit && Bc_limit > bc_cap) {
+        Bc_limit = hex_align_down(bc_cap, bc_unit);
     }
     // Cost coefficients calibrated from profiling
     const size_t c_q_fixed    = 800;   // per-Q-block: q_load + epilogue o_update + o_norm + o_store

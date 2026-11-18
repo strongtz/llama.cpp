@@ -317,6 +317,7 @@ static bool fuse_mul_mat_id_nx(const ggml_hexagon_session * sess, htp_opnode & p
     auto * orig_kparams = prev.kparams<htp_mm_kernel_params>();
     const auto * cur_kparams = cur.kparams<htp_mm_kernel_params>();
 
+    if (orig_kparams->unused) return false;   // biases already fused
     if (x_in != x || ids_in != ids || w_in->type != w0->type ||
         w_in->ne[0] != w0->ne[0] || w_in->ne[2] != w0->ne[2] ||
         ggml_hexagon_tensor_is_tiled(w_in) != ggml_hexagon_tensor_is_tiled(w0) ||
@@ -338,6 +339,85 @@ static bool fuse_mul_mat_id_nx(const ggml_hexagon_session * sess, htp_opnode & p
     prev.outputs.push_back(d_in);
     prev.fused.push_back(cur.node);
     prev.set_kparams(kparams);
+    return true;
+}
+
+// MUL_MAT_ID(_NX) + ADD_ID: the expert bias is added while scattering the HMX output
+static bool fuse_mul_mat_id_add_id(const ggml_hexagon_session * sess, htp_opnode & prev, const htp_opnode & cur) {
+    if (prev.opcode != HTP_OP_MUL_MAT_ID && prev.opcode != HTP_OP_MUL_MAT_ID_NX) return false;
+    if (htp_session_mdev_count(sess) > 1) return false;
+
+    auto * kp = prev.kparams<htp_mm_kernel_params>();
+    if (!kp->n_hmx || kp->kernel_type != HTP_MM_KERNEL_HMX_2D) return false;
+
+    const uint32_t n_w = (prev.opcode == HTP_OP_MUL_MAT_ID_NX) ? kp->n_weights : 1;
+    if (n_w == 0 || n_w > 4 || prev.outputs.size() != n_w || prev.inputs.size() < n_w + 2) return false;
+    if (prev.inputs.size() + 1 > HTP_OP_MAX_INPUTS) return false;
+
+    const ggml_tensor * a    = cur.node->src[0];
+    const ggml_tensor * b    = cur.node->src[1];
+    const ggml_tensor * ids  = cur.node->src[2];
+    const ggml_tensor * dst  = cur.node;
+    if (!a || !b || !ids || ids != prev.inputs[n_w + 1]) return false;
+
+    int p = -1;
+    for (uint32_t i = 0; i < n_w; ++i) {
+        if (htp_same_tensor_data(prev.outputs[i], a)) { p = (int) i; break; }
+    }
+    if (p < 0 || (kp->unused & ((1u << p) | HTP_MM_FUSED_SWIGLU_OAI))) return false;
+    if (!ggml_hexagon_tensor_is_fuseable(a)) return false;
+
+    const ggml_tensor * w = prev.inputs[0];
+    if (b->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 || a->type != GGML_TYPE_F32 ||
+        b->ne[0] != a->ne[0] || b->ne[1] != w->ne[2] || b->nb[0] != sizeof(float) ||
+        !ggml_are_same_shape(a, dst) || !ggml_are_same_stride(a, dst) || (a->ne[0] % 32) != 0) {
+        return false;
+    }
+
+    const uint32_t pos = n_w + 2 + __builtin_popcount(kp->unused & ((1u << p) - 1));
+    prev.inputs.insert(prev.inputs.begin() + pos, b);
+    prev.outputs[p] = dst;
+    prev.fused.push_back(cur.node);
+    kp->unused |= (uint8_t) (1u << p);
+    return true;
+}
+
+// MUL_MAT_ID_NX(gate, up) [+ ADD_ID biases] + SWIGLU_OAI: computed in the HMX MoE epilogue
+static bool fuse_mul_mat_id_swiglu_oai(const ggml_hexagon_session * sess, htp_opnode & prev, const htp_opnode & cur) {
+    if (prev.opcode != HTP_OP_MUL_MAT_ID_NX || htp_session_mdev_count(sess) > 1) return false;
+    // off by default: on HVX-bound MoE layers the fused epilogue costs as much as the separate op saves
+    static const bool enabled = getenv("GGML_HEXAGON_MOE_GLU_FUSION") && atoi(getenv("GGML_HEXAGON_MOE_GLU_FUSION")) != 0;
+    if (!enabled) return false;
+
+    auto * kp = prev.kparams<htp_mm_kernel_params>();
+    if (!kp->n_hmx || kp->kernel_type != HTP_MM_KERNEL_HMX_2D || kp->n_weights != 2 ||
+        (kp->unused & HTP_MM_FUSED_SWIGLU_OAI) || prev.outputs.size() != 2) {
+        return false;
+    }
+    const ggml_tensor * dst = cur.node;
+    const ggml_tensor * x   = dst->src[0];
+    const ggml_tensor * y   = dst->src[1];
+    if (!x || !y || ggml_get_op_params_i32(dst, 1) != 0) return false;   // swapped
+
+    int gi = -1, ui = -1;
+    for (int i = 0; i < 2; ++i) {
+        if (htp_same_tensor_data(prev.outputs[i], x)) gi = i;
+        if (htp_same_tensor_data(prev.outputs[i], y)) ui = i;
+    }
+    if (gi < 0 || ui < 0 || gi == ui) return false;
+    if (!ggml_hexagon_tensor_is_fuseable(prev.outputs[0]) || !ggml_hexagon_tensor_is_fuseable(prev.outputs[1])) return false;
+    if (dst->type != GGML_TYPE_F32 || !ggml_are_same_shape(x, dst) || !ggml_are_same_stride(x, dst) ||
+        !ggml_are_same_stride(x, y) || (x->ne[0] % 32) != 0) {
+        return false;
+    }
+
+    kp->unused   |= HTP_MM_FUSED_SWIGLU_OAI;
+    kp->glu_gate  = (uint8_t) gi;
+    kp->glu_alpha = ggml_get_op_params_f32(dst, 2);
+    kp->glu_limit = ggml_get_op_params_f32(dst, 3);
+    prev.outputs[0] = dst;
+    prev.outputs[1] = dst;
+    prev.fused.push_back(cur.node);
     return true;
 }
 
@@ -628,7 +708,7 @@ void htp_fusion_tag_graph(struct ggml_cgraph * graph) {
         const ggml_op op = node->op;
         if ((op == GGML_OP_RMS_NORM || op == GGML_OP_SCALE || op == GGML_OP_REPEAT ||
              op == GGML_OP_UNARY    || op == GGML_OP_ADD   || op == GGML_OP_SUB    ||
-             op == GGML_OP_MUL      || op == GGML_OP_DIV   || op == GGML_OP_MUL_MAT_ID ||
+             op == GGML_OP_MUL      || op == GGML_OP_DIV   || op == GGML_OP_MUL_MAT_ID || op == GGML_OP_ADD_ID ||
              op == GGML_OP_SSM_CONV ||
              (op == GGML_OP_MUL_MAT && !htp_is_hadamard(node))) &&
             ggml_node_has_n_uses(graph, i, 1)) {
@@ -666,6 +746,10 @@ bool htp_fusion_try_fuse(const struct ggml_hexagon_session * sess, struct htp_op
             return htp_fusion_enabled(HTP_FUSE_MUL_MAT_NX) && fuse_mul_mat_nx(sess, prev, cur);
         case HTP_OP_MUL_MAT_ID:
             return htp_fusion_enabled(HTP_FUSE_MUL_MAT_ID_NX) && fuse_mul_mat_id_nx(sess, prev, cur);
+        case HTP_OP_ADD_ID:
+            return fuse_mul_mat_id_add_id(sess, prev, cur);
+        case HTP_OP_GLU_SWIGLU_OAI:
+            return fuse_mul_mat_id_swiglu_oai(sess, prev, cur);
         default:
             return false;
     }
